@@ -1,0 +1,1109 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+/* Manual dark mode -- an explicit choice (the toggle in AppShell), not
+   prefers-color-scheme. data-theme="dark" on <html> is set before hydration
+   (see the inline script at the top of layout.tsx's <body>) so there is no
+   light-then-dark flash, and it is a *:where() selector so it also matches
+   plain descendant elements, not just data-theme itself carrying the class. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* ---- Surface/ink tokens ----
+   This pass covers the persistent app chrome (sidebar, header) and the
+   dashboard page end to end -- every other page still reads the light
+   values below unconditionally (their components don't reference these
+   vars yet), which is exactly why they stay correct and untouched rather
+   than half-converted. Defaults are pixel-matches for the slate palette
+   already used everywhere, so nothing shifts until data-theme="dark" is
+   actually set. */
+:root {
+  --surface-0: #f8fafc;
+  --surface-1: #ffffff;
+  --surface-2: #f8fafc;
+  --border-c: #e2e8f0;
+  --border-c2: #f1f5f9;
+  --border-strong-c: #cbd5e1;
+  --ink-1: #0f172a;
+  --ink-2: #334155;
+  --ink-3: #475569;
+  --ink-4: #64748b;
+  --ink-5: #94a3b8;
+  --chart-axis: #94a3b8;
+  --chart-grid: #f1f5f9;
+  --track-c: #f1f5f9;
+  --hover-c: #f8fafc;
+  --hover-c2: #f1f5f9;
+  --wash-emerald: #d1fae5;
+  --wash-emerald-ink: #059669;
+  --wash-emerald-border: #a7f3d0;
+  --wash-rose: #ffe4e6;
+  --wash-rose-ink: #e11d48;
+  --wash-rose-border: #fecdd3;
+  --wash-amber: #fef3c7;
+  --wash-amber-ink: #d97706;
+  --wash-amber-border: #fde68a;
+  --wash-indigo: #e0e7ff;
+  --wash-indigo-ink: #4338ca;
+  --wash-plum: #f3e8ff;
+  --wash-plum-ink: var(--brand);
+  --wash-slate: #f1f5f9;
+  --wash-slate-ink: #64748b;
+  --wash-sky: #e0f2fe;
+  --wash-sky-ink: #0369a1;
+  --wash-violet: #ede9fe;
+  --wash-violet-ink: #6d28d9;
+  /* Shakhmatka cell fills -- same colour as the matching --wash-* by
+     default (nothing changes for light mode), overridden separately in
+     dark mode below. Kept apart from --wash-* on purpose: those stay
+     tuned for a small text pill/badge (audit log, status chips), where a
+     low-alpha tint over a bright surface is exactly right -- but a
+     shakhmatka cell is a big filled tile, and the SAME low-alpha tint
+     read against the dark theme's near-black surface instead of a badge's
+     usual "murky dark green/maroon", not the cheerful pastel a light-mode
+     cell shows. Renaming those to fix the cell without touching the
+     dozen unrelated badges that share --wash-* would have been a much
+     bigger, riskier change than adding one more token per hue. */
+  --cell-emerald: var(--wash-emerald);
+  --cell-amber: var(--wash-amber);
+  --cell-rose: var(--wash-rose);
+  --cell-sky: var(--wash-sky);
+  --cell-violet: var(--wash-violet);
+  /* The one fixed yellow, available in both modes and independent of the
+     company's hero theme -- for the handful of spots (BackLink's hover)
+     that want to read as "the Лимӯ accent" specifically, not "whatever
+     --brand currently is". --accent-dark (below, dark-mode only) is
+     defined in terms of this so there's one hex to change, not two. */
+  --accent-yellow: #facc15;
+  --side-active-bg: #ffffff;
+  --side-active-ink: #0f172a;
+  --side-active-icon: var(--brand);
+  --field-bg: #ffffff;
+  --field-border: #cbd5e1;
+  --field-focus-border: #94a3b8;
+  --field-focus-ring: rgb(15 23 42 / 0.1);
+  --modal-scrim: rgb(15 23 42 / 0.5);
+  /* Matches whatever .bg-brand's dark-mode override (further down) sets
+     `color` to -- for a child span that sits INSIDE a bg-brand button but
+     isn't bg-brand itself, so it can't inherit that override's win over a
+     literal text-white the way the button's own text does. */
+  --on-brand: #ffffff;
+}
+
+:root[data-theme="dark"] {
+  --surface-0: #0d0d0f;
+  --surface-1: #18181b;
+  --surface-2: #1f1f22;
+  --border-c: #29292c;
+  --border-c2: #232326;
+  --border-strong-c: #3a3a3f;
+  --ink-1: #f5f5f0;
+  --ink-2: #d4d4c9;
+  --ink-3: #b3b3a8;
+  --ink-4: #8f8f86;
+  --ink-5: #6b6b64;
+  --chart-axis: #6b6b64;
+  --chart-grid: #232326;
+  --track-c: #232326;
+  --hover-c: #1f1f22;
+  --hover-c2: #29292c;
+  --wash-emerald: rgba(16, 185, 129, 0.16);
+  --wash-emerald-ink: #34d399;
+  --wash-emerald-border: rgba(16, 185, 129, 0.3);
+  --wash-rose: rgba(244, 63, 94, 0.16);
+  --wash-rose-ink: #fb7185;
+  --wash-rose-border: rgba(244, 63, 94, 0.28);
+  --wash-amber: rgba(245, 158, 11, 0.16);
+  --wash-amber-ink: #fbbf24;
+  --wash-amber-border: rgba(245, 158, 11, 0.3);
+  --wash-indigo: rgba(99, 102, 241, 0.18);
+  --wash-indigo-ink: #a5b4fc;
+  --wash-plum: rgba(250, 204, 21, 0.14);
+  --wash-plum-ink: #facc15;
+  --wash-slate: #232326;
+  --wash-slate-ink: #a8a89e;
+  --wash-sky: rgba(56, 189, 248, 0.16);
+  --wash-sky-ink: #38bdf8;
+  --wash-violet: rgba(167, 139, 250, 0.18);
+  --wash-violet-ink: #c4b5fd;
+  /* Brighter than --wash-*, not just more of the same tint: built from the
+     lighter *-ink hue (the one already picked for legibility against dark,
+     e.g. #34d399 not the darker #10b981 --wash-emerald blends toward) at a
+     higher alpha, so the tile itself reads as a lit pastel square instead
+     of a dim, muddy one. Request was specifically "brighter, not more
+     saturated" -- a stronger tint of the SAME dark base (higher alpha on
+     --wash-emerald's own rgba(16,185,129,...)) would have gone the other
+     way, more intense rather than lighter. */
+  --cell-emerald: rgba(52, 211, 153, 0.3);
+  --cell-amber: rgba(251, 191, 36, 0.28);
+  --cell-rose: rgba(251, 113, 133, 0.28);
+  --cell-sky: rgba(56, 189, 248, 0.28);
+  --cell-violet: rgba(196, 181, 253, 0.28);
+  --side-active-bg: #232326;
+  --side-active-ink: #f5f5f0;
+  --side-active-icon: #facc15;
+  /* Fields get the yellow accent on focus -- the one place "bright, yellow,
+     obviously interactive" (the actual ask) matters most, since it's the
+     control the user is looking at right when it matters. Idle, a field
+     stays quiet (--field-border, not yellow) so the accent still reads as
+     "this one is active" rather than wallpapering every input on the
+     page. */
+  --field-bg: #1c1c1f;
+  --field-border: #3a3a3f;
+  --field-focus-border: #facc15;
+  --field-focus-ring: rgb(250 204 21 / 0.3);
+  --modal-scrim: rgb(0 0 0 / 0.6);
+  --on-brand: #18181b;
+  /* The one fixed accent dark mode adds on top of the company's own theme.
+     Used directly for the sidebar/nav highlight, and indirectly -- via the
+     .bg-brand/.btn-brand overrides further down -- for every primary
+     button app-wide, so "yellow" reads as ONE consistent accent rather
+     than several near-yellows. */
+  --accent-dark: var(--accent-yellow);
+}
+
+/* Contract documents (standalone print page and the in-modal preview after
+   booking) share the #contract-print-area id. When printing, hide
+   everything else on the page -- the sidebar, modal backdrop, buttons --
+   and let just the document fill the sheet, wherever in the DOM it sits.
+   Deliberately NOT repositioned (no position:fixed): fixed elements don't
+   paginate in print, they just repeat the same single-viewport-height
+   slice on every page, which silently cut the contract body off a
+   multi-page document entirely. visibility:hidden alone is enough --
+   everything else already collapses via its own print:hidden (display:
+   none) classes, so there's no leftover blank space to worry about. */
+@media print {
+  body:has(#contract-print-area) * {
+    visibility: hidden;
+  }
+  body:has(#contract-print-area) #contract-print-area,
+  body:has(#contract-print-area) #contract-print-area * {
+    visibility: visible;
+  }
+  /* Pull the document to the top-left corner of the sheet. Without this it
+     stays where it sat in the page flow -- below the (hidden but still
+     space-taking) toolbar and inside the app's centered column -- which
+     printed as a page with big skewed empty margins. position:absolute
+     (never fixed) still paginates multi-page content correctly. */
+  body:has(#contract-print-area) #contract-print-area {
+    position: absolute;
+    inset: 0 auto auto 0;
+    width: 100%;
+    margin: 0;
+  }
+
+  /* A4, with a small even margin instead of each browser's own default
+     (often lopsided, sometimes huge) -- the printed page shouldn't carry
+     any more whitespace at the edges than this. */
+  @page {
+    size: A4;
+    margin: 12mm 14mm;
+  }
+}
+
+
+/* ---- Motion & the dashboard hero's signature gradient ----
+   Palette pulled from Tajik atlas/adras silk (ikat) weaving -- indigo
+   ground shot through with saffron and mulberry -- rather than a generic
+   purple-blue SaaS gradient. Used once, deliberately, for the hero; the
+   rest of the app stays on the quiet slate/emerald/rose system. */
+:root {
+  --atlas-indigo: #1c1a3a;
+  --atlas-plum: #5b3468;
+  --atlas-saffron: #e3a73b;
+  --atlas-apricot: #f0c47a;
+  /* Checkboxes, radios, range inputs pick up the brand color natively. */
+  accent-color: var(--atlas-plum);
+
+  /* Hero gradient stops -- swappable by theme. Default = "atlas" (indigo →
+     plum → saffron). Other themes below re-point these three variables, so a
+     one-line data attribute on <html> restyles the whole hero. */
+  --hero-1: var(--atlas-indigo);
+  --hero-2: var(--atlas-plum);
+  --hero-3: var(--atlas-saffron);
+}
+
+/* Зумуррад — a deep emerald/teal theme. */
+:root[data-hero-theme="emerald"] {
+  --hero-1: #06302b;
+  --hero-2: #0f766e;
+  --hero-3: #6ee7b7;
+  accent-color: #0f766e;
+}
+
+/* Шафақ — a dusk rose/amber theme. */
+:root[data-hero-theme="sunset"] {
+  --hero-1: #3b0764;
+  --hero-2: #be185d;
+  --hero-3: #f59e0b;
+  accent-color: #be185d;
+}
+
+/* Лимӯ — onyx graphite with an acid-lemon accent.
+   The lemon is the third stop only. It cannot be --brand: the primary buttons
+   put white text on --brand, and white on #facc15 is roughly 1.9:1 -- illegible.
+   So the buttons stay graphite and the lemon does the accent work. */
+:root[data-hero-theme="lemon"] {
+  --hero-1: #18181b;
+  --hero-2: #3f3f46;
+  --hero-3: #facc15;
+  accent-color: #eab308;
+}
+
+/* Brand accent for buttons/pills -- follows the company theme so switching to
+   green (etc.) recolours the primary buttons too, not just the hero. Printed
+   documents keep their own fixed plum and do NOT use these. */
+:root {
+  --brand: #5b3468;
+  --brand-strong: #1c1a3a;
+}
+:root[data-hero-theme="emerald"] { --brand: #0f766e; --brand-strong: #06302b; }
+:root[data-hero-theme="sunset"] { --brand: #be185d; --brand-strong: #3b0764; }
+:root[data-hero-theme="lemon"] { --brand: #3f3f46; --brand-strong: #18181b; }
+
+.btn-brand {
+  background-image: linear-gradient(to right, var(--brand-strong), var(--brand));
+}
+/* Лимӯ asked to be flat everywhere, not just motion-free -- this two-tone
+   blend is subtle (both stops are graphite) but it is still a gradient,
+   so it goes solid here too, same as .hero-gradient below. */
+:root[data-hero-theme="lemon"] .btn-brand,
+:root[data-hero-theme="lemon"] .btn-primary {
+  background-image: none;
+  background-color: var(--brand);
+}
+.bg-brand { background-color: var(--brand); }
+.bg-brand-strong { background-color: var(--brand-strong); }
+.text-brand { color: var(--brand); }
+.border-brand { border-color: var(--brand); }
+.bg-brand-soft { background-color: color-mix(in srgb, var(--brand) 8%, transparent); }
+.border-brand-soft { border-color: color-mix(in srgb, var(--brand) 28%, transparent); }
+
+/* Dark mode's primary-action colour. --brand itself is left alone (still
+   whatever the company's light-mode theme picked) -- these override the
+   utility CLASSES instead, which is every button/pill in the app that
+   asked for "the brand colour" specifically as its own surface, paired
+   with white text right on the same element. That pairing is exactly what
+   swaps: yellow fill, dark ink, so it stays legible instead of repeating
+   the lemon theme's own white-on-#facc15 problem (see .btn-brand's
+   original comment on that contract). Scoped to the classes, not the
+   variable, so nothing that reads --brand for some OTHER reason silently
+   changes underneath it. */
+:root[data-theme="dark"] .btn-brand,
+:root[data-theme="dark"] .btn-primary,
+:root[data-theme="dark"] .bg-brand {
+  background: var(--accent-dark);
+  background-image: none;
+  color: #18181b;
+}
+:root[data-theme="dark"] .text-brand {
+  color: var(--accent-dark);
+}
+:root[data-theme="dark"] .border-brand {
+  border-color: var(--accent-dark);
+}
+:root[data-theme="dark"] .bg-brand-soft {
+  background-color: color-mix(in srgb, var(--accent-dark) 14%, transparent);
+}
+:root[data-theme="dark"] .border-brand-soft {
+  border-color: color-mix(in srgb, var(--accent-dark) 35%, transparent);
+}
+
+/* Shared "add" action -- outline in the brand colour at rest, fills on
+   hover via a sweep (a scaleX'd ::before, not a flat colour swap) so the
+   interaction reads as switching on, not just recolouring. One class for
+   every button in the app that adds something (a unit, a client, a
+   payment, a floor/block, a new record) so they read as one control
+   instead of each page inventing its own. Sizes via .btn-add-sm/-md/-lg;
+   AddButton (components/AddButton.tsx) is the one place that assembles
+   these plus the plus-icon -- edit the look here, not per call site. */
+.btn-add {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4em;
+  border: 1.5px solid color-mix(in srgb, var(--brand) 34%, transparent);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--brand);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1),
+    color 0.22s,
+    border-color 0.15s;
+}
+.btn-add::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-image: linear-gradient(to right, var(--brand-strong), var(--brand));
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.28s ease;
+}
+:root[data-hero-theme="lemon"] .btn-add::before {
+  background-image: none;
+  background-color: var(--brand);
+}
+.btn-add:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: transparent;
+  color: #fff;
+}
+.btn-add:hover:not(:disabled)::before {
+  transform: scaleX(1);
+}
+.btn-add:active:not(:disabled) {
+  transform: translateY(0) scale(0.97);
+}
+.btn-add:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-add svg {
+  transition: transform 0.28s ease;
+}
+.btn-add:hover:not(:disabled) svg {
+  transform: rotate(45deg);
+}
+/* Same dark-mode swap .btn-brand gets: the company's own brand colour is
+   left alone, the fixed yellow accent takes over for every primary-ish
+   action so dark mode reads as one consistent accent. */
+:root[data-theme="dark"] .btn-add {
+  border-color: color-mix(in srgb, var(--accent-dark) 38%, transparent);
+  color: var(--accent-dark);
+}
+:root[data-theme="dark"] .btn-add::before {
+  background-image: none;
+  background-color: var(--accent-dark);
+}
+:root[data-theme="dark"] .btn-add:hover:not(:disabled) {
+  color: #18181b;
+}
+/* Solid, quieter variant for the one loud call-to-action per screen: graphite
+   with a yellow plus, and it turns yellow only on hover. A yellow fill at rest
+   was too much neon next to a yellow-tinted panel; graphite lets the panel keep
+   the colour and the button keep the weight. */
+.btn-add-accent {
+  background: #18181b;
+  border-color: #18181b;
+  color: #fff;
+  box-shadow: 0 6px 14px -8px rgb(24 24 27 / 0.7);
+}
+.btn-add-accent::before {
+  display: none;
+}
+.btn-add-accent svg {
+  color: var(--accent-yellow);
+}
+.btn-add-accent:hover:not(:disabled) {
+  background: var(--accent-yellow);
+  border-color: var(--accent-yellow);
+  color: #18181b;
+  box-shadow: 0 8px 18px -8px rgb(250 204 21 / 0.8);
+}
+.btn-add-accent:hover:not(:disabled) svg {
+  color: #18181b;
+}
+:root[data-theme="dark"] .btn-add-accent {
+  background: color-mix(in srgb, var(--accent-yellow) 14%, #18181b);
+  border-color: color-mix(in srgb, var(--accent-yellow) 55%, transparent);
+  color: var(--accent-yellow);
+}
+:root[data-theme="dark"] .btn-add-accent:hover:not(:disabled) {
+  background: var(--accent-yellow);
+  border-color: var(--accent-yellow);
+  color: #18181b;
+}
+.btn-add-sm {
+  height: 1.875rem;
+  padding: 0 0.75rem;
+  font-size: 0.75rem;
+  border-radius: 7px;
+}
+.btn-add-md {
+  height: 2.375rem;
+  padding: 0 1rem;
+  font-size: 0.8125rem;
+}
+.btn-add-lg {
+  height: 2.875rem;
+  padding: 0 1.25rem;
+  font-size: 0.9375rem;
+  border-radius: 10px;
+}
+.btn-add-block {
+  width: 100%;
+}
+
+/* ---- Shared action buttons ----
+   Every Save / Cancel / Delete / Print-style button in the app is one of
+   these: `.btn` + one variant + one size, e.g. "btn btn-primary btn-md".
+   Before this each page hand-rolled its own class string, so the same
+   action came out with a flat fill here, a gradient there, three different
+   greys for "secondary", and two different reds for "danger". Change the
+   look HERE, not per call site (same rule as .btn-add above).
+
+   Variants:  btn-primary     the main action (brand fill)
+              btn-secondary   neutral outline (Cancel, Upload, Apply...)
+              btn-ghost       quiet tertiary, no outline ("Skip")
+              btn-light       white fill, for use ON a dark/brand surface
+              btn-danger      destructive, filled (the final "Delete")
+              btn-danger-soft destructive, outlined (a "Delete" that opens
+                              a confirm rather than doing it)
+   ("Back" is never one of these -- it is always <BackLink>.)
+   Sizes:     btn-xs / btn-sm / btn-md / btn-lg   (32 / 36 / 40 / 44px)
+   Layout-only extras (flex-1, w-full, mt-*, ml-auto) still come from
+   utilities at the call site.
+
+   In @layer components on purpose: unlayered CSS beats every layered rule
+   regardless of specificity, so unlayered here would make those layout
+   utilities silently lose. The brand fill's theme overrides (lemon = flat,
+   dark = yellow) are shared with .btn-brand further up, not repeated. */
+@layer components {
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    border-radius: 0.5rem;
+    font-weight: 600;
+    line-height: 1.25rem;
+    cursor: pointer;
+    transition:
+      background-color 0.15s,
+      border-color 0.15s,
+      color 0.15s,
+      box-shadow 0.15s,
+      filter 0.15s,
+      transform 0.1s;
+  }
+  .btn:active:not(:disabled) {
+    transform: scale(0.98);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn:focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: 2px;
+  }
+
+  .btn-xs {
+    height: 2rem;
+    padding-inline: 0.75rem;
+    font-size: 0.75rem;
+  }
+  .btn-sm {
+    height: 2.25rem;
+    padding-inline: 0.875rem;
+    font-size: 0.875rem;
+  }
+  .btn-md {
+    height: 2.5rem;
+    padding-inline: 1.25rem;
+    font-size: 0.875rem;
+  }
+  .btn-lg {
+    height: 2.75rem;
+    padding-inline: 1.25rem;
+    font-size: 0.875rem;
+  }
+  /* Square icon-only button at the same heights (a "..." menu trigger). */
+  .btn-icon {
+    padding-inline: 0;
+    aspect-ratio: 1;
+  }
+
+  .btn-primary {
+    background-image: linear-gradient(to right, var(--brand-strong), var(--brand));
+    color: #fff;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
+  }
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.1);
+    box-shadow:
+      0 4px 6px -1px rgb(0 0 0 / 0.12),
+      0 2px 4px -2px rgb(0 0 0 / 0.1);
+  }
+
+  .btn-secondary {
+    border: 1px solid var(--field-border);
+    color: var(--ink-2);
+    font-weight: 500;
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background-color: var(--hover-c);
+  }
+
+  /* Quiet tertiary action ("Skip", "Later") -- no outline, muted ink. */
+  .btn-ghost {
+    color: var(--ink-4);
+    font-weight: 500;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background-color: var(--hover-c2);
+    color: var(--ink-2);
+  }
+
+  /* White fill for a button sitting ON a dark or brand-coloured surface
+     (dashboard hero, sidebar panel, install banner), where a brand-filled
+     button would vanish into its own background. */
+  .btn-light {
+    background-color: #fff;
+    color: #0f172a;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
+  }
+  .btn-light:hover:not(:disabled) {
+    box-shadow:
+      0 4px 6px -1px rgb(0 0 0 / 0.14),
+      0 2px 4px -2px rgb(0 0 0 / 0.1);
+  }
+
+  /* The Лимӯ accent as a button fill, with a fixed near-black label (white on
+     yellow fails contrast -- same reason BackLink uses a fixed dark ink).
+     Used on the login screen, where the surrounding panels are black and
+     paper and the brand colour would not stand out. */
+  .btn-yellow {
+    background-color: var(--accent-yellow);
+    color: #18181b;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.2);
+  }
+  .btn-yellow:hover:not(:disabled) {
+    filter: brightness(1.06);
+  }
+
+  .btn-danger {
+    background-color: #dc2626;
+    color: #fff;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background-color: #b91c1c;
+  }
+
+  .btn-danger-soft {
+    border: 1px solid var(--wash-rose-border);
+    color: var(--wash-rose-ink);
+    font-weight: 500;
+  }
+  .btn-danger-soft:hover:not(:disabled) {
+    border-color: var(--wash-rose-ink);
+    background-color: var(--wash-rose);
+  }
+}
+
+::selection {
+  background: rgb(227 167 59 / 0.35);
+  color: var(--atlas-indigo);
+}
+
+.hero-gradient {
+  background: linear-gradient(
+    115deg,
+    var(--hero-1) 0%,
+    var(--hero-2) 45%,
+    var(--hero-3) 100%
+  );
+}
+
+/* Oversized and slowly panned so the gradient itself breathes -- the colours
+   drift a few degrees back and forth over half a minute.
+   ONLY on .hero-surface, i.e. the one big dashboard hero that opts in.
+   background-position is NOT a compositor-only property: every frame is a real
+   repaint of the whole painted area. `.hero-gradient` is also on the sidebar,
+   the PIN screen, every building card without a photo and every client avatar
+   -- so as written this had a list of fifty clients repainting fifty animated
+   gradients forever, which is a large part of why the app felt like treacle. */
+.hero-surface {
+  background-size: 180% 180%;
+  animation: hero-pan 28s ease-in-out infinite;
+}
+
+@keyframes hero-pan {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-surface {
+    animation: none;
+  }
+}
+
+/* Лимӯ asked to be the quiet theme from the start: no pan, no drifting
+   glow, wherever those would otherwise show -- the dashboard hero AND the
+   sidebar's glow blob, not conditional on dark mode also being on. Every
+   other theme keeps its motion; this is Лимӯ specifically, by name. */
+:root[data-hero-theme="lemon"] .hero-surface {
+  animation: none;
+}
+:root[data-hero-theme="lemon"] .animate-hero-glow,
+:root[data-hero-theme="lemon"] .animate-hero-glow-2 {
+  display: none;
+}
+
+/* Лимӯ, flattened: no motion was only half of "static" -- the gradient
+   itself (graphite → grey → lemon, diagonal) was still a blend, just a
+   still one. This drops it to one flat fill (the darkest stop) on every
+   .hero-gradient surface at once -- sidebar, dashboard hero, PIN screen,
+   the "waiting for access" screen, building-card placeholders, client
+   avatars -- rather than only the couple of "big" spots someone might
+   think to fix by hand.
+   The lemon then earns its keep as one deliberate mark instead of a
+   background ingredient: a 3px rule along the top edge of the surfaces
+   big enough for it to read as a line rather than a smear. Opt-in via
+   .hero-panel (sidebar, dashboard hero, PIN screen, waiting-for-access)
+   rather than blanket on .hero-gradient, so a 24px avatar or a building
+   placeholder icon doesn't get a rule as thick as it is tall. */
+:root[data-hero-theme="lemon"] .hero-gradient {
+  background: var(--hero-1);
+}
+:root[data-hero-theme="lemon"] .hero-panel {
+  border-top: 3px solid var(--hero-3);
+}
+/* Same flattening for the login card's own top accent bar -- it isn't a
+   .hero-gradient surface (it lives on the white card, not the themed
+   panel), so it needed its own rule to stop blending graphite into lemon. */
+:root[data-hero-theme="lemon"] .card-accent-bar {
+  background-image: none;
+  background-color: var(--hero-3);
+}
+
+/* ---- Hero ornament overlay ----
+   An optional woven-texture pattern laid over the gradient. Only surfaces
+   that opt in with `.hero-surface` get it (so tiny .hero-gradient avatars
+   stay clean). The pattern itself is a white SVG tile chosen by
+   data-hero-pattern on <html>; it reads as texture over any colour theme. */
+.hero-surface::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: var(--hero-pattern, none);
+  background-size: var(--hero-pattern-size, 40px 40px);
+  opacity: var(--hero-pattern-opacity, 0);
+  pointer-events: none;
+}
+
+/* Атлас нақш — an ikat-style diamond lattice with a centre knot. */
+:root[data-hero-pattern="ikat"] {
+  --hero-pattern: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='46' height='46'%3E%3Cg fill='none' stroke='%23fff' stroke-width='1'%3E%3Cpath d='M23 1 L45 23 L23 45 L1 23 Z'/%3E%3C/g%3E%3Ccircle cx='23' cy='23' r='2' fill='%23fff'/%3E%3C/svg%3E");
+  --hero-pattern-size: 46px 46px;
+  --hero-pattern-opacity: 0.16;
+}
+
+/* Нуқтаҳо — a quiet dot grid. */
+:root[data-hero-pattern="dots"] {
+  --hero-pattern: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22'%3E%3Ccircle cx='2' cy='2' r='1.4' fill='%23fff'/%3E%3C/svg%3E");
+  --hero-pattern-size: 22px 22px;
+  --hero-pattern-opacity: 0.2;
+}
+
+/* Мавҷ — flowing waves. */
+:root[data-hero-pattern="waves"] {
+  --hero-pattern: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='60' height='20'%3E%3Cpath d='M0 10 Q15 0 30 10 T60 10' fill='none' stroke='%23fff' stroke-width='1.2'/%3E%3C/svg%3E");
+  --hero-pattern-size: 60px 20px;
+  --hero-pattern-opacity: 0.16;
+}
+
+/* ---- The sidebar in dark mode ----
+   Every other surface it sits next to (light: white/slate-50) inverts
+   through the tokens above. The sidebar can't just invert the same way --
+   it is ALREADY dark in light mode (the company's own hero gradient), and a
+   near-black graphite bar next to another dark colour reads as clutter, not
+   contrast. So dark mode replaces the gradient with the same flat graphite
+   the rest of the page uses, rather than darkening it further. Scoped to
+   .app-sidebar specifically (not .hero-gradient) so the rare "waiting for
+   role" screen and the small avatar/building-card swatches elsewhere keep
+   their normal company colour regardless of page theme -- this is chrome,
+   not decoration. */
+:root[data-theme="dark"] .app-sidebar {
+  background: var(--surface-1);
+  border-right: 1px solid var(--border-c);
+}
+:root[data-theme="dark"] .app-sidebar .side-glow {
+  display: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes fade-up {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .animate-fade-up {
+    animation: fade-up 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  @keyframes hero-glow {
+    0%,
+    100% {
+      transform: translate(0, 0) scale(1);
+      opacity: 0.5;
+    }
+    50% {
+      transform: translate(30px, 20px) scale(1.15);
+      opacity: 0.85;
+    }
+  }
+
+  .animate-hero-glow {
+    animation: hero-glow 10s ease-in-out infinite;
+  }
+
+  @keyframes hero-glow-2 {
+    0%,
+    100% {
+      transform: translate(0, 0) scale(1);
+      opacity: 0.35;
+    }
+    50% {
+      transform: translate(-40px, -15px) scale(1.2);
+      opacity: 0.6;
+    }
+  }
+
+  .animate-hero-glow-2 {
+    animation: hero-glow-2 14s ease-in-out infinite;
+  }
+
+  @keyframes nav-dot {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 1;
+    }
+    50% {
+      transform: scale(1.6);
+      opacity: 0.55;
+    }
+  }
+
+  .animate-nav-dot {
+    animation: nav-dot 2.4s ease-in-out infinite;
+  }
+
+  @keyframes modal-backdrop-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes modal-panel-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.97);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  .animate-modal-backdrop {
+    animation: modal-backdrop-in 0.2s ease-out both;
+  }
+
+  .animate-modal-panel {
+    animation: modal-panel-in 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  @keyframes toast-countdown {
+    from {
+      transform: scaleX(1);
+    }
+    to {
+      transform: scaleX(0);
+    }
+  }
+
+  /* Buttons and button-styled links get a light press/lift interaction
+     everywhere in the app by default, so the whole product feels tactile
+     without hand-adding transition classes to every one of them. */
+  button:not(:disabled),
+  a[class*="rounded-"] {
+    transition:
+      transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1),
+      filter 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+  button:not(:disabled):active,
+  a[class*="rounded-"]:active {
+    transform: scale(0.96);
+  }
+}
+
+/* ---- Atlas-tinted interactivity ----
+   Every primary action, focus ring, and hover wash draws from the same
+   hero palette, so the whole app answers to one color voice instead of
+   generic gray buttons living under an indigo-saffron hero. These are
+   deliberately unlayered rules: in Tailwind v4 unlayered author CSS wins
+   over the utilities layer, which lets one block recolor every existing
+   `bg-slate-900` button without touching each component. Screen-only —
+   printed documents keep their plain ink-on-paper look. */
+@media screen {
+  button.bg-slate-900:not(:disabled),
+  a.bg-slate-900 {
+    background-image: linear-gradient(
+      135deg,
+      #2b2456 0%,
+      var(--atlas-plum) 70%,
+      #7c4a63 115%
+    );
+  }
+  button.bg-slate-900:not(:disabled):hover,
+  a.bg-slate-900:hover {
+    box-shadow:
+      0 4px 16px rgb(91 52 104 / 0.35),
+      0 1px 4px rgb(227 167 59 / 0.25);
+    filter: saturate(1.15) brightness(1.08);
+  }
+
+  /* Quiet/outline buttons warm up on hover instead of going gray. */
+  button[class*="border-slate-300"]:not(:disabled):hover,
+  a[class*="border-slate-300"]:hover {
+    border-color: rgb(91 52 104 / 0.45);
+    background-color: rgb(91 52 104 / 0.05);
+  }
+
+  /* One focus language for every text field: plum border, soft saffron
+     halo. Overrides each input's own slate focus utilities at once. */
+  input:not([type="checkbox"]):not([type="radio"]):focus,
+  select:focus,
+  textarea:focus {
+    outline: none;
+    border-color: #18181b;
+    box-shadow: 0 0 0 3px rgb(250 204 21 / 0.38);
+  }
+  :root[data-theme="dark"] input:not([type="checkbox"]):not([type="radio"]):focus,
+  :root[data-theme="dark"] select:focus,
+  :root[data-theme="dark"] textarea:focus {
+    border-color: var(--accent-yellow);
+    box-shadow: 0 0 0 3px rgb(250 204 21 / 0.28);
+  }
+
+  /* Every dropdown gets the same drawn chevron instead of each browser's own
+     (a black OS arrow that ignored the theme), and lights its edge yellow on
+     hover like the rest of the controls. Opt out with data-plain when a select
+     draws its own arrow (the dashboard's glass filters). */
+  select:not([multiple]):not([size]):not([data-plain]) {
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9.5l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.6rem center;
+    background-size: 0.95rem;
+    padding-right: 2.15rem;
+  }
+  :root[data-theme="dark"] select:not([multiple]):not([size]):not([data-plain]) {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9.5l6 6 6-6'/%3E%3C/svg%3E");
+  }
+  select:not(:disabled):hover {
+    border-color: var(--accent-yellow);
+  }
+
+  /* Keyboard navigation gets a clearly visible saffron outline. */
+  button:focus-visible,
+  a:focus-visible {
+    outline: 2px solid var(--atlas-saffron);
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-up {
+    opacity: 1;
+  }
+}
+
+/* Contract printing: page numbering, minimize widows/orphans, compact
+   spacing. The @page rule applies globally to all print output; #contract-*
+   selectors target specific layouts. */
+@page {
+  margin: 12mm 10mm;
+  /* Page counter at the bottom center of every page. */
+  @bottom-center {
+    content: counter(page);
+    font-size: 10pt;
+    color: #6b7280;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+}
+
+#contract-print-area {
+  orphans: 3;
+  widows: 3;
+}
+
+#contract-print-area > div {
+  /* Space between copies is for screen only; printing should go
+     copy-to-copy with no gap between pages. */
+  margin: 0;
+}
+
+#contract-print-area section {
+  page-break-inside: avoid;
+  page-break-after: auto;
+}
+
+#contract-print-area p {
+  orphans: 2;
+  widows: 2;
+  margin-bottom: 0.5rem;
+  line-height: 1.5;
+}
+
+#contract-print-area table {
+  page-break-inside: avoid;
+}
+
+
+/* ---- Chart reveal animations ----
+   Deliberately pure CSS, with the element ALREADY at its final size in the
+   DOM. The first version gated the size behind a React state flag flipped
+   from requestAnimationFrame -- and when rAF doesn't run (a background tab, a
+   throttled or non-compositing page), the flag never flipped and every bar,
+   stacked column and donut slice rendered at zero. A chart that shows no data
+   when an animation frame is skipped is broken, not merely un-animated.
+   Here the animation only ever plays ON TOP of correct output: remove it and
+   the chart is simply static. */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes chart-grow-up {
+    from {
+      transform: scaleY(0);
+    }
+    to {
+      transform: scaleY(1);
+    }
+  }
+
+  /* No fill-mode here. "both" holds the element in the FROM state (scaleY(0),
+     opacity 0) until the animation actually starts -- and if it never starts,
+     the data stays invisible for good. Without it the element sits at its real
+     size and the animation only ever plays on top of correct output. */
+  .animate-chart-grow {
+    transform-origin: bottom;
+    animation: chart-grow-up 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes chart-grow-sideways {
+    from {
+      transform: scaleX(0);
+    }
+    to {
+      transform: scaleX(1);
+    }
+  }
+
+  .animate-chart-grow-x {
+    transform-origin: left;
+    animation: chart-grow-sideways 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes chart-fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(12px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .animate-chart-fade {
+    animation: chart-fade-in 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes chart-donut-in {
+    from {
+      opacity: 0;
+      transform: rotate(-90deg) scale(0.85);
+    }
+    to {
+      opacity: 1;
+      transform: rotate(-90deg) scale(1);
+    }
+  }
+
+  /* Keeps the -90deg start offset the donut is drawn with. */
+  .animate-chart-donut {
+    animation: chart-donut-in 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
+
+/* ---- One hover language for the shared buttons ----
+   Same as the toolbar controls: hover = "you can press this" = yellow with dark
+   ink. Primary keeps the company colour at rest; secondary and ghost are quiet
+   at rest. Unlayered and last on purpose -- the lemon and dark theme overrides
+   above are unlayered too and would otherwise win over the layered hover. */
+@media screen {
+  .btn-primary:hover:not(:disabled) {
+    background-image: none;
+    background-color: var(--accent-yellow);
+    color: #18181b;
+    filter: none;
+    box-shadow: 0 6px 14px -8px rgb(250 204 21 / 0.9);
+  }
+  :root[data-theme="dark"] .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.08);
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background-color: var(--accent-yellow);
+    border-color: var(--accent-yellow);
+    color: #18181b;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background-color: color-mix(in srgb, var(--accent-yellow) 32%, transparent);
+    color: var(--ink-1);
+  }
+}
+
+/* Touch behaviour, everywhere.
+   - touch-action: manipulation keeps pinch-zoom (an accessibility feature) but
+     switches off double-tap zoom, so two quick taps on a button are two taps,
+     not a zoom -- the "I pressed it twice and the screen jumped" complaint.
+   - iOS zooms the page whenever a field under 16px gets focus. On touch
+     screens every field is at least 16px, so opening a form never zooms. */
+html,
+body,
+button,
+a,
+label,
+select,
+summary,
+[role="button"],
+[role="switch"] {
+  touch-action: manipulation;
+}
+@media (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  select,
+  textarea {
+    font-size: max(16px, 1em);
+  }
+}

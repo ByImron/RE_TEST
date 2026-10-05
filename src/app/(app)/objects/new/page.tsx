@@ -1,0 +1,67 @@
+"use client";
+
+import { useSingleFlight } from "@/lib/useSingleFlight";
+import { useState } from "react";
+import { BackLink } from "@/components/BackLink";
+import { useRouter } from "next/navigation";
+import { createClient } from "@/lib/supabase/client";
+import { isSupabaseConfigured } from "@/lib/supabase/isConfigured";
+import { useLocale } from "@/lib/i18n/LocaleProvider";
+import { SetupNotice } from "@/components/SetupNotice";
+import { ObjectForm } from "@/components/ObjectForm";
+import { useRole } from "@/lib/auth/useRole";
+import type { PropertyObjectInput } from "@/lib/objects/types";
+import { PageTitle } from "@/components/PageTitle";
+
+export default function NewObjectPage() {
+  const { t } = useLocale();
+  const once = useSingleFlight();
+  const router = useRouter();
+  const configured = isSupabaseConfigured();
+  const { role, loading: roleLoading } = useRole();
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async (values: PropertyObjectInput) => {
+    setSubmitting(true);
+    const supabase = createClient();
+    const { data, error } = await supabase
+      .schema("crm")
+      .from("objects")
+      .insert({
+        name: values.name,
+        address: values.address || null,
+        type: values.type,
+        status: values.status,
+        rooms: values.rooms ? Number(values.rooms) : null,
+        area: values.area ? Number(values.area) : null,
+        price: values.price ? Number(values.price) : null,
+        currency: values.currency,
+        description: values.description || null,
+        plan_url: values.plan_url || null,
+      })
+      .select("id")
+      .single();
+    setSubmitting(false);
+    if (!error && data) {
+      router.push(`/objects/${data.id}`);
+    }
+  };
+
+  if (!roleLoading && role !== "admin") {
+    return (
+      <div className="flex flex-col gap-3">
+        <BackLink href="/objects">{t.objects.backToList}</BackLink>
+        <p className="text-[var(--ink-4)]">{t.users.accessDenied}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <BackLink href="/objects">{t.objects.backToList}</BackLink>
+      <PageTitle>{t.objects.newObject}</PageTitle>
+      {!configured && <SetupNotice />}
+      <ObjectForm submitting={submitting} onSubmit={once(handleSubmit)} />
+    </div>
+  );
+}

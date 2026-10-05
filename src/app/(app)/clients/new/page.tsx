@@ -1,0 +1,57 @@
+"use client";
+
+import { useSingleFlight } from "@/lib/useSingleFlight";
+import { useState } from "react";
+import { BackLink } from "@/components/BackLink";
+import { useRouter } from "next/navigation";
+import { createClient } from "@/lib/supabase/client";
+import { isSupabaseConfigured } from "@/lib/supabase/isConfigured";
+import { useLocale } from "@/lib/i18n/LocaleProvider";
+import { SetupNotice } from "@/components/SetupNotice";
+import { ClientForm } from "@/components/ClientForm";
+import type { ClientInput } from "@/lib/clients/types";
+import { PageTitle } from "@/components/PageTitle";
+
+export default function NewClientPage() {
+  const { t } = useLocale();
+  const once = useSingleFlight();
+  const router = useRouter();
+  const configured = isSupabaseConfigured();
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async (values: ClientInput) => {
+    setSubmitting(true);
+    const supabase = createClient();
+    const { data, error } = await supabase
+      .schema("crm")
+      .from("clients")
+      .insert({
+        name: values.name,
+        phone: values.phone || null,
+        phone2: values.phone2 || null,
+        email: values.email || null,
+        passport: values.passport || null,
+        passport_issued_by: values.passport_issued_by || null,
+        birth_date: values.birth_date || null,
+        address: values.address || null,
+        source: values.source || null,
+        interested_object_id: values.interested_object_id || null,
+        notes: values.notes || null,
+      })
+      .select("id")
+      .single();
+    setSubmitting(false);
+    if (!error && data) {
+      router.push(`/clients/${data.id}`);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-5">
+      <BackLink href="/clients">{t.clients.backToList}</BackLink>
+      <PageTitle>{t.clients.newClient}</PageTitle>
+      {!configured && <SetupNotice />}
+      <ClientForm submitting={submitting} onSubmit={once(handleSubmit)} />
+    </div>
+  );
+}

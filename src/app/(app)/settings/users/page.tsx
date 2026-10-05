@@ -1,0 +1,563 @@
+"use client";
+
+import { useSingleFlight } from "@/lib/useSingleFlight";
+import { useCallback, useEffect, useState } from "react";
+import { BackLink } from "@/components/BackLink";
+import { useLocale } from "@/lib/i18n/LocaleProvider";
+import { createClient } from "@/lib/supabase/client";
+import { useRole, type Role } from "@/lib/auth/useRole";
+import { defaultAccess, isFinanceLevel, isLevel, type FinanceLevel, type Level } from "@/lib/auth/access";
+import type { Building } from "@/lib/buildings/types";
+import { PageTitle } from "@/components/PageTitle";
+
+// A user in the staff list can be role-less ("none") -- that's a person
+// created in Supabase Auth who hasn't been given a role yet. The whole
+// point of this page is to turn those into managers/directors/admins.
+type StaffRole = Role | "none";
+type StaffUser = {
+  id: string;
+  email: string | null;
+  role: StaffRole;
+  created_at: string;
+  // Individual overrides of what the role allows; null = "by role".
+  sales_level?: Level | null;
+  finance_level?: FinanceLevel | null;
+};
+
+// Where an account is open right now (crm.list_sessions): the device it last
+// signed in on and when it was last seen.
+type StaffSession = { device: string | null; last_seen: string };
+
+function agoText(iso: string, t: ReturnType<typeof useLocale>["t"]): string {
+  const minutes = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60_000));
+  if (minutes < 1) return t.users.ago.now;
+  if (minutes < 60) return t.users.ago.min.replace("{n}", String(minutes));
+  if (minutes < 60 * 24) return t.users.ago.hour.replace("{n}", String(Math.round(minutes / 60)));
+  return t.users.ago.day.replace("{n}", String(Math.round(minutes / (60 * 24))));
+}
+
+async function authHeaders() {
+  const supabase = createClient();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  return {
+    "Content-Type": "application/json",
+    ...(session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {}),
+  };
+}
+
+export default function UsersPage() {
+  const { t } = useLocale();
+  const once = useSingleFlight();
+  const { role, loading: roleLoading } = useRole();
+
+  const [users, setUsers] = useState<StaffUser[]>([]);
+  const [buildings, setBuildings] = useState<Building[]>([]);
+  // "One account, one device": the switch (null = the database is not updated
+  // yet, so no switch is shown) and where each account is open.
+  const [singleSession, setSingleSession] = useState<boolean | null>(null);
+  const [sessions, setSessions] = useState<Record<string, StaffSession>>({});
+  const [assignments, setAssignments] = useState<Record<string, Set<string>>>({});
+  const [expandedUser, setExpandedUser] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Optional convenience: create straight from here. Needs the server
+  // service key; when it isn't set this simply fails with a clear message
+  // and the admin uses the Supabase-Dashboard path instead. The LIST and
+  // ROLE assignment below never touch the service key.
+  const [showCreate, setShowCreate] = useState(false);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [newRole, setNewRole] = useState<Role>("manager");
+  const [creating, setCreating] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    const supabase = createClient();
+    // Users come from an in-database RPC (list_staff), not the service-key
+    // API -- so this page works even when SUPABASE_SERVICE_ROLE_KEY is
+    // wrong or unset.
+    const [staffRes, buildingsRes, assignmentsRes, sessionsRes, switchRes] = await Promise.all([
+      supabase.schema("crm").rpc("list_staff"),
+      supabase.schema("crm").from("buildings").select("*").order("name"),
+      supabase.schema("crm").from("manager_buildings").select("user_id, building_id"),
+      supabase.schema("crm").rpc("list_sessions"),
+      supabase.schema("crm").from("settings").select("single_session").maybeSingle(),
+    ]);
+    setSessions(
+      sessionsRes.error
+        ? {}
+        : Object.fromEntries(
+            ((sessionsRes.data ?? []) as Array<StaffSession & { user_id: string }>).map((s) => [s.user_id, s])
+          )
+    );
+    setSingleSession(switchRes.error || !switchRes.data ? null : Boolean(switchRes.data.single_session));
+    if (staffRes.error) {
+      setError(staffRes.error.message);
+      setUsers([]);
+    } else {
+      setUsers((staffRes.data ?? []) as StaffUser[]);
+    }
+    setBuildings((buildingsRes.data ?? []) as Building[]);
+    const map: Record<string, Set<string>> = {};
+    for (const row of (assignmentsRes.data ?? []) as Array<{
+      user_id: string;
+      building_id: string;
+    }>) {
+      (map[row.user_id] ??= new Set()).add(row.building_id);
+    }
+    setAssignments(map);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    if (role === "admin") load();
+  }, [role, load]);
+
+  const handleCreate = async () => {
+    setCreating(true);
+    setError(null);
+    const res = await fetch("/api/admin/users", {
+      method: "POST",
+      headers: await authHeaders(),
+      body: JSON.stringify({ email, password, role: newRole }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      setEmail("");
+      setPassword("");
+      setNewRole("manager");
+      setShowCreate(false);
+      await load();
+    } else {
+      setError(data.error);
+    }
+    setCreating(false);
+  };
+
+  // Role changes go through the set_user_role RPC (admin-guarded in the DB).
+  const handleRoleChange = async (userId: string, newUserRole: StaffRole) => {
+    setError(null);
+    const prev = users;
+    setUsers((us) => us.map((u) => (u.id === userId ? { ...u, role: newUserRole } : u)));
+    const supabase = createClient();
+    const { error: rpcError } = await supabase
+      .schema("crm")
+      .rpc("set_user_role", { p_user: userId, p_role: newUserRole });
+    if (rpcError) {
+      setError(rpcError.message);
+      setUsers(prev); // revert
+    }
+  };
+
+  // Individual access: an override of what the role allows in sales or in
+  // finance (null = by role). Goes through an admin-guarded RPC.
+  const handleAccessChange = async (
+    userId: string,
+    next: { sales: Level | null; finance: FinanceLevel | null }
+  ) => {
+    setError(null);
+    const prev = users;
+    setUsers((us) =>
+      us.map((u) => (u.id === userId ? { ...u, sales_level: next.sales, finance_level: next.finance } : u))
+    );
+    const { error: rpcError } = await createClient()
+      .schema("crm")
+      .rpc("set_user_access", { p_user: userId, p_sales: next.sales ?? "", p_finance: next.finance ?? "" });
+    if (rpcError) {
+      setError(rpcError.message);
+      setUsers(prev); // revert
+    }
+  };
+
+  const handleSingleSession = async () => {
+    if (singleSession === null) return;
+    const next = !singleSession;
+    setSingleSession(next);
+    setError(null);
+    const { error: dbError } = await createClient().schema("crm").from("settings").update({ single_session: next }).eq("id", true);
+    if (dbError) {
+      setError(dbError.message);
+      setSingleSession(!next);
+    }
+  };
+
+  const toggleAssignment = async (userId: string, buildingId: string) => {
+    const supabase = createClient();
+    const has = assignments[userId]?.has(buildingId) ?? false;
+    setAssignments((prev) => {
+      const next = { ...prev, [userId]: new Set(prev[userId] ?? []) };
+      if (has) next[userId].delete(buildingId);
+      else next[userId].add(buildingId);
+      return next;
+    });
+    const { error: writeError } = has
+      ? await supabase
+          .schema("crm")
+          .from("manager_buildings")
+          .delete()
+          .eq("user_id", userId)
+          .eq("building_id", buildingId)
+      : await supabase
+          .schema("crm")
+          .from("manager_buildings")
+          .insert({ user_id: userId, building_id: buildingId });
+    if (writeError) {
+      setError(writeError.message);
+      await load();
+    }
+  };
+
+  if (roleLoading) return <p className="text-[var(--ink-5)]">{t.common.loading}</p>;
+  if (role !== "admin") {
+    return (
+      <div className="flex flex-col gap-3">
+        <BackLink href="/settings">{t.users.backToSettings}</BackLink>
+        <p className="text-[var(--ink-4)]">{t.users.accessDenied}</p>
+        <WhoAmI />
+      </div>
+    );
+  }
+
+  const roleOptions: { value: StaffRole; label: string }[] = [
+    { value: "none", label: t.users.roleNone },
+    { value: "manager", label: t.users.roleManager },
+    { value: "director", label: t.users.roleDirector },
+    { value: "accountant", label: t.users.roleAccountant },
+    { value: "procurement", label: t.users.roleProcurement },
+    { value: "admin", label: t.users.roleAdmin },
+  ];
+
+  return (
+    <div className="flex max-w-3xl flex-col gap-5">
+      <BackLink href="/settings">{t.users.backToSettings}</BackLink>
+      <PageTitle>{t.users.title}</PageTitle>
+
+      {/* How-to: the reliable path is create-in-Supabase, assign-here. */}
+      <div className="rounded-xl border border-brand-soft bg-brand-soft p-4 text-sm text-[var(--ink-3)]">
+        <p className="font-semibold text-brand">{t.users.howToTitle}</p>
+        <ol className="mt-1.5 list-decimal space-y-0.5 pl-5">
+          <li>{t.users.howTo1}</li>
+          <li>{t.users.howTo2}</li>
+          <li>{t.users.howTo3}</li>
+        </ol>
+        <button
+          type="button"
+          onClick={() => setShowCreate((s) => !s)}
+          className="-mx-1 mt-2 w-fit rounded px-1 text-xs font-medium text-brand transition-colors hover:bg-brand-soft"
+        >
+          {showCreate ? t.users.hideCreate : t.users.showCreate}
+        </button>
+      </div>
+
+      {/* Optional direct-create form (needs the service key). */}
+      {showCreate && (
+        <div className="rounded-xl border border-[var(--border-c)] bg-[var(--surface-1)] p-4 shadow-sm">
+          <div className="flex flex-wrap items-end gap-2.5">
+            <label className="flex min-w-52 flex-1 flex-col gap-1 text-xs">
+              <span className="font-semibold text-[var(--ink-3)]">{t.users.email}</span>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="name@mail.com"
+                className="h-10 rounded-lg border border-[var(--field-border)] bg-[var(--field-bg)] px-3 text-sm text-[var(--ink-1)] focus:border-[var(--field-focus-border)] focus:outline-none focus:ring-2 focus:ring-[var(--field-focus-ring)]"
+              />
+            </label>
+            <label className="flex min-w-40 flex-1 flex-col gap-1 text-xs">
+              <span className="font-semibold text-[var(--ink-3)]">{t.users.password}</span>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••"
+                className="h-10 rounded-lg border border-[var(--field-border)] bg-[var(--field-bg)] px-3 text-sm text-[var(--ink-1)] focus:border-[var(--field-focus-border)] focus:outline-none focus:ring-2 focus:ring-[var(--field-focus-ring)]"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-xs">
+              <span className="font-semibold text-[var(--ink-3)]">{t.users.role}</span>
+              <select
+                value={newRole}
+                onChange={(e) => setNewRole(e.target.value as Role)}
+                className="h-10 rounded-lg border border-[var(--field-border)] bg-[var(--field-bg)] px-3 text-sm text-[var(--ink-1)]"
+              >
+                <option value="manager">{t.users.roleManager}</option>
+                <option value="director">{t.users.roleDirector}</option>
+                <option value="accountant">{t.users.roleAccountant}</option>
+                <option value="procurement">{t.users.roleProcurement}</option>
+                <option value="admin">{t.users.roleAdmin}</option>
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={once(handleCreate)}
+              disabled={creating || !email || password.length < 6}
+              className="btn btn-primary btn-md"
+            >
+              {creating ? t.users.creating : t.users.create}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {singleSession !== null && (
+        <div className="flex items-start gap-3 rounded-xl border border-[var(--border-c)] bg-[var(--surface-1)] p-4 shadow-sm">
+          <span className="min-w-0 flex-1">
+            <span className="block text-sm font-semibold text-[var(--ink-1)]">{t.users.singleSession}</span>
+            <span className="mt-0.5 block text-xs leading-snug text-[var(--ink-4)]">{t.users.singleSessionHint}</span>
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={singleSession}
+            aria-label={t.users.singleSession}
+            onClick={() => void handleSingleSession()}
+            className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors duration-150 ${
+              singleSession
+                ? "border-[#18181b] bg-[#18181b] dark:border-[var(--accent-yellow)] dark:bg-[var(--accent-yellow)]"
+                : "border-[var(--border-strong-c)] bg-[var(--hover-c2)]"
+            }`}
+          >
+            <span
+              aria-hidden="true"
+              className={`absolute top-[3px] h-5 w-5 rounded-full transition-all duration-150 ${
+                singleSession ? "left-[24px] bg-[var(--accent-yellow)] dark:bg-[#18181b]" : "left-[3px] bg-[var(--ink-5)]"
+              }`}
+            />
+          </button>
+        </div>
+      )}
+
+      {error && <p className="text-sm text-[var(--wash-rose-ink)]">{error}</p>}
+
+      {loading ? (
+        <p className="text-[var(--ink-5)]">{t.common.loading}</p>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border border-[var(--border-c)] bg-[var(--surface-1)] shadow-sm">
+          <table className="w-full min-w-[520px] border-collapse text-left text-sm">
+            <thead className="border-b border-[var(--border-c)] text-[var(--ink-4)]">
+              <tr>
+                <th className="px-4 py-3 font-medium">{t.users.email}</th>
+                <th className="px-4 py-3 font-medium">{t.users.role}</th>
+                <th className="px-4 py-3 font-medium">{t.users.createdAt}</th>
+                <th className="px-4 py-3 font-medium">{t.users.actions}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="px-4 py-6 text-center text-[var(--ink-5)]">
+                    {t.users.empty}
+                  </td>
+                </tr>
+              )}
+              {users.map((u) => (
+                <UserRow
+                  key={u.id}
+                  user={u}
+                  roleOptions={roleOptions}
+                  buildings={buildings}
+                  assigned={assignments[u.id]}
+                  session={sessions[u.id]}
+                  expanded={expandedUser === u.id}
+                  onToggleExpand={() =>
+                    setExpandedUser((prev) => (prev === u.id ? null : u.id))
+                  }
+                  onRoleChange={(r) => handleRoleChange(u.id, r)}
+                  onAccessChange={(next) => handleAccessChange(u.id, next)}
+                  onToggleBuilding={(bId) => toggleAssignment(u.id, bId)}
+                  t={t}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UserRow({
+  user,
+  roleOptions,
+  buildings,
+  assigned,
+  session,
+  expanded,
+  onToggleExpand,
+  onRoleChange,
+  onAccessChange,
+  onToggleBuilding,
+  t,
+}: {
+  user: StaffUser;
+  roleOptions: { value: StaffRole; label: string }[];
+  buildings: Building[];
+  assigned: Set<string> | undefined;
+  session: StaffSession | undefined;
+  expanded: boolean;
+  onToggleExpand: () => void;
+  onRoleChange: (r: StaffRole) => void;
+  onAccessChange: (next: { sales: Level | null; finance: FinanceLevel | null }) => void;
+  onToggleBuilding: (buildingId: string) => void;
+  t: ReturnType<typeof useLocale>["t"];
+}) {
+  // Everyone with a role except the admin (whose access cannot be reduced)
+  // gets the access panel: the two levels, and for a manager the buildings.
+  const hasPanel = user.role !== "none" && user.role !== "admin";
+  const base = defaultAccess(user.role);
+  const custom = user.sales_level != null || user.finance_level != null;
+  const roleTone: Record<StaffRole, string> = {
+    none: "border-[var(--field-border)] text-[var(--ink-5)]",
+    manager: "border-[var(--wash-sky-ink)] text-[var(--wash-sky-ink)]",
+    director: "border-[var(--wash-amber-ink)] text-[var(--wash-amber-ink)]",
+    accountant: "border-[var(--wash-emerald-ink)] text-[var(--wash-emerald-ink)]",
+    procurement: "border-[var(--wash-rose-ink)] text-[var(--wash-rose-ink)]",
+    admin: "border-brand-soft text-brand",
+  };
+  return (
+    <>
+      <tr className="border-b border-[var(--border-c2)] last:border-0">
+        <td className="px-4 py-2.5">
+          {user.email}
+          <span className="block text-xs text-[var(--ink-5)]">
+            {session
+              ? t.users.sessionOn
+                  .replace("{device}", session.device ?? "—")
+                  .replace("{when}", agoText(session.last_seen, t))
+              : t.users.sessionNone}
+          </span>
+        </td>
+        <td className="px-4 py-2.5">
+          <select
+            value={user.role}
+            onChange={(e) => onRoleChange(e.target.value as StaffRole)}
+            className={`rounded-md border bg-[var(--surface-1)] px-2 py-1 font-medium ${roleTone[user.role]}`}
+          >
+            {roleOptions.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </td>
+        <td className="px-4 py-2.5 text-[var(--ink-4)]">
+          {new Date(user.created_at).toLocaleDateString()}
+        </td>
+        <td className="px-4 py-2.5">
+          {hasPanel && (
+            <button
+              type="button"
+              onClick={onToggleExpand}
+              aria-expanded={expanded}
+              className="btn btn-secondary btn-xs"
+            >
+              {t.users.accessButton}
+              {custom && (
+                <span className="ml-1 rounded-full bg-[var(--accent-yellow)] px-1.5 py-px text-[10px] font-bold text-[#18181b]">
+                  {t.users.customAccess}
+                </span>
+              )}
+            </button>
+          )}
+        </td>
+      </tr>
+      {expanded && hasPanel && (
+        <tr className="border-b border-[var(--border-c2)]">
+          <td colSpan={4} className="bg-[var(--surface-2)] px-4 py-4">
+            <p className="text-sm font-semibold text-[var(--ink-1)]">{t.users.accessTitle}</p>
+            <p className="mb-3 mt-0.5 max-w-2xl text-xs leading-snug text-[var(--ink-4)]">{t.users.accessHint}</p>
+            <div className="grid max-w-2xl gap-3 sm:grid-cols-2">
+              {(
+                [
+                  ["sales", t.users.salesAccess, t.users.salesAccessHint, user.sales_level, base.sales],
+                  ["finance", t.users.financeAccess, t.users.financeAccessHint, user.finance_level, base.finance],
+                ] as const
+              ).map(([area, label, hint, current, byRole]) => (
+                <label key={area} className="flex flex-col gap-1">
+                  <span className="text-[13px] font-semibold text-[var(--ink-2)]">{label}</span>
+                  <select
+                    value={current ?? ""}
+                    aria-label={label}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      onAccessChange({
+                        sales: area === "sales" ? (isLevel(raw) ? raw : null) : (user.sales_level ?? null),
+                        finance: area === "finance" ? (isFinanceLevel(raw) ? raw : null) : (user.finance_level ?? null),
+                      });
+                    }}
+                    className="h-10 rounded-lg border border-[var(--field-border)] bg-[var(--field-bg)] px-3 text-sm text-[var(--ink-1)]"
+                  >
+                    <option value="">
+                      {t.users.byRole}: {t.users.levels[byRole].toLowerCase()}
+                    </option>
+                    <option value="none">{t.users.levels.none}</option>
+                    <option value="read">{t.users.levels.read}</option>
+                    <option value="write">{t.users.levels.write}</option>
+                    {area === "finance" && <option value="own">{t.users.levels.own}</option>}
+                  </select>
+                  <span className="text-xs leading-snug text-[var(--ink-5)]">{hint}</span>
+                </label>
+              ))}
+            </div>
+            {user.role === "manager" && (
+              <p className="mb-2 mt-4 text-xs font-medium text-[var(--ink-4)]">
+                {t.users.assignBuildings} ({assigned?.size ?? 0}) — {t.users.assignHint}
+              </p>
+            )}
+            {user.role !== "manager" ? null : buildings.length === 0 ? (
+              <p className="text-xs text-[var(--ink-5)]">{t.buildings.empty}</p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {buildings.map((b) => {
+                  const checked = assigned?.has(b.id) ?? false;
+                  return (
+                    <button
+                      key={b.id}
+                      type="button"
+                      onClick={() => onToggleBuilding(b.id)}
+                      className={`rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-all active:scale-95 ${
+                        checked
+                          ? "border-brand bg-brand text-white"
+                          : "border-[var(--field-border)] bg-[var(--surface-1)] text-[var(--ink-3)] hover:bg-[var(--hover-c2)]"
+                      }`}
+                    >
+                      {checked ? "✓ " : ""}
+                      {b.name}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function WhoAmI() {
+  const [info, setInfo] = useState<string | null>(null);
+  useEffect(() => {
+    const supabase = createClient();
+    supabase.auth.getUser().then(async ({ data }) => {
+      const u = data.user;
+      if (!u) {
+        setInfo(null);
+        return;
+      }
+      const { data: p } = await supabase
+        .schema("crm")
+        .from("profiles")
+        .select("role")
+        .eq("id", u.id)
+        .maybeSingle();
+      setInfo(`${u.email} — ${p?.role ?? "—"}`);
+    });
+  }, []);
+  if (!info) return null;
+  return <p className="text-xs text-[var(--ink-5)]">{info}</p>;
+}
