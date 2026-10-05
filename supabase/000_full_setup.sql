@@ -260,7 +260,7 @@ create table if not exists crm.settings (
   id boolean primary key default true,
   usd_rate numeric not null default 10.5,
   sms_api_key text,
-  sms_sender_name text default 'BurjiBohtar',
+  sms_sender_name text,
   sms_reminder_days integer not null default 3,
   updated_at timestamptz not null default now(),
   constraint settings_singleton check (id)
@@ -354,7 +354,6 @@ grant all on all sequences in schema crm to anon, authenticated;
 alter table crm.objects add column if not exists span integer not null default 1;
 
 alter table crm.settings alter column sms_sender_name drop default;
-update crm.settings set sms_sender_name = null where sms_sender_name = 'BurjiBohtar';
 
 -- ############################################################
 -- ### 005_auth_rls.sql
@@ -2076,10 +2075,6 @@ grant execute on function crm.set_user_role(uuid, text) to authenticated;
 -- ПОСЛЕ ПЕРВОГО ВХОДА ОБЯЗАТЕЛЬНО СМЕНИТЕ ПАРОЛЬ в программе:
 -- Настройки → «Сменить пароль».
 --
--- Заодно, если в базе уже есть аккаунт iammirzozoda@gmail.com,
--- который не пускал, — этот файл чинит его: подтверждает почту и
--- делает админом.
---
 -- Файл идемпотентный — можно запускать повторно. ВАЖНО (блок 057):
 -- пароль задаётся только при первом создании аккаунта. Если аккаунт уже
 -- есть, повторный запуск больше НЕ переписывает его пароль обратно на
@@ -2182,9 +2177,6 @@ revoke all on function crm.ensure_admin(text, text) from authenticated;
 
 -- Готовый вход "из коробки".
 select crm.ensure_admin('admin@crm.tj', 'Admin12345');
-
--- Чиним/поднимаем ваш личный аккаунт, если он был заведён раньше.
-select crm.ensure_admin('iammirzozoda@gmail.com', 'Admin12345');
 
 -- ############################################################
 -- ### 030_sales_by_manager.sql
