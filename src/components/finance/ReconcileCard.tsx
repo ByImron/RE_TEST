@@ -40,6 +40,13 @@ type CheckResult = {
   duplicate_categories: Array<{ kind: string; name: string; ids: string[]; count: number }>;
 };
 
+// crm.finance_balance_check(): balances that went below zero before the
+// no-overdraft rule existed (or by deleting money that was already spent).
+type BalanceCheck = {
+  negative_cash: Array<{ currency: string; value: number }>;
+  overspent: Array<{ email: string; currency: string; balance: number }>;
+};
+
 const nf = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
 const differs = (a: number, b: number) => Math.abs(a - b) > 0.005;
 
@@ -57,17 +64,21 @@ export function ReconcileCard() {
   const { bump } = useFinance();
   const once = useSingleFlight();
   const [result, setResult] = useState<CheckResult | null>(null);
+  const [balances, setBalances] = useState<BalanceCheck | null>(null);
   const [status, setStatus] = useState<"idle" | "running" | "failed">("idle");
   const [repaired, setRepaired] = useState<number | null>(null);
 
   const run = async () => {
     setStatus("running");
-    const { data, error } = await createClient().schema("crm").rpc("finance_check");
-    if (error || !data) {
+    const db = createClient().schema("crm");
+    const [check, bal] = await Promise.all([db.rpc("finance_check"), db.rpc("finance_balance_check")]);
+    if (check.error || !check.data) {
       setStatus("failed");
       return;
     }
-    setResult(data as CheckResult);
+    setResult(check.data as CheckResult);
+    // An older database has no balance check: the rest of the reconciliation still stands.
+    setBalances(bal.error ? null : (bal.data as BalanceCheck));
     setStatus("idle");
   };
 
@@ -102,8 +113,10 @@ export function ReconcileCard() {
           p.contracts_count !== p.journal_count
       )
     : [];
+  const negatives = balances ? balances.negative_cash.length + balances.overspent.length : 0;
   const ok =
     result !== null &&
+    negatives === 0 &&
     mismatched.length === 0 &&
     result.gaps.length === 0 &&
     result.building_drift.length === 0 &&
@@ -244,6 +257,41 @@ export function ReconcileCard() {
               {t.finance.check.dupCategoriesFix}
             </Link>
           )}
+        </div>
+      )}
+      {balances && negatives > 0 && (
+        <div className="rounded-xl bg-[var(--wash-rose)] px-4 py-3 text-[var(--wash-rose-ink)]">
+          {balances.negative_cash.length > 0 && (
+            <>
+              <p className="text-sm font-semibold">{t.finance.check.negativeCashTitle}</p>
+              <ul className="mt-1 flex flex-col gap-0.5 text-sm tabular-nums">
+                {balances.negative_cash.map((c) => (
+                  <li key={c.currency}>
+                    {t.finance.check.negativeCashLine
+                      .replace("{currency}", c.currency)
+                      .replace("{sum}", `−${nf.format(Math.abs(c.value))} ${c.currency}`)}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {balances.overspent.length > 0 && (
+            <>
+              <p className={`text-sm font-semibold ${balances.negative_cash.length > 0 ? "mt-2.5" : ""}`}>
+                {t.finance.check.overspentTitle}
+              </p>
+              <ul className="mt-1 flex flex-col gap-0.5 text-sm tabular-nums">
+                {balances.overspent.map((p) => (
+                  <li key={`${p.email}-${p.currency}`}>
+                    {t.finance.check.overspentLine
+                      .replace("{email}", p.email)
+                      .replace("{sum}", `−${nf.format(Math.abs(p.balance))} ${p.currency}`)}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          <p className="mt-2 text-xs leading-snug opacity-80">{t.finance.check.negativeHint}</p>
         </div>
       )}
       {result && result.rollup_mismatch > 0 && (

@@ -6,36 +6,17 @@ import type { Dictionary } from "@/lib/i18n/dictionaries";
 import { formatCurrency, type Currency } from "@/lib/currency";
 import { formatShortDate } from "@/lib/formatDate";
 import { waLink } from "@/lib/whatsapp";
-import { HBarChart } from "@/components/charts/HBarChart";
-import { STATUS_HUES } from "@/components/charts/palette";
+import { reminderText } from "@/lib/debtors/reminder";
+import { isWhatsAppPhone } from "@/lib/phone";
+import type { ContractDebt } from "@/lib/debtors/debtors";
+import { unitLabel } from "@/lib/objects/format";
+import { elapsedSince, formatElapsed, type ElapsedWords } from "@/lib/debtors/elapsed";
 import { IconAction } from "@/components/ActionBar";
-import { WarningIcon } from "@/components/icons";
+import { WarningIcon, WhatsAppIcon } from "@/components/icons";
 
-// One reminder PER CONTRACT, not per missed installment. A long installment
-// plan with nothing paid used to spill one row per overdue month (9, 20, 30
-// rows for the same flat); now it's a single line summing what's overdue.
-// Paid installments drop out on their own, so recording a payment shrinks the
-// reminder and fully closing the plan removes it entirely.
-export type ContractDebt = {
-  contractId: string;
-  clientId: string | null;
-  clientName: string;
-  clientPhone: string | null;
-  objectName: string | null;
-  contractNumber: string | null;
-  currency: Currency;
-  missedCount: number;
-  totalOverdue: number;
-  // The whole balance of the contract, not just the overdue slice -- the two
-  // were being confused for each other on screen.
-  remainingTotal: number;
-  // Earliest missed date = since when in arrears; latest = the current period
-  // to chase. Days overdue is measured from the latest, so it reflects the
-  // present cycle and rolls forward each month instead of ballooning to 785.
-  earliestDue: string;
-  latestDue: string;
-  daysOverdue: number;
-};
+// The row type lives in lib/debtors/debtors.ts, with how the list is read; re-exported
+// so the screens that import it from here keep working.
+export type { ContractDebt };
 
 // How long a debt has been open, in three bands the eye can sort at a glance:
 // just missed (a reminder usually fixes it), a few weeks (needs a call), and
@@ -105,19 +86,14 @@ function AgeBadge({ debt, t }: { debt: ContractDebt; t: Dictionary }) {
 }
 
 function WhatsAppLink({ debt, t, block = false }: { debt: ContractDebt; t: Dictionary; block?: boolean }) {
-  if (!debt.clientPhone) {
+  // The same test the "message everyone" round uses: a number that cannot open a
+  // chat (a stray "12") is not offered as if it could.
+  if (!isWhatsAppPhone(debt.clientPhone)) {
     return <span className="text-xs text-[var(--ink-5)]">{t.debtors.noPhone}</span>;
   }
   return (
     <a
-      href={waLink(
-        debt.clientPhone,
-        t.debtors.reminderMsg
-          .replace("{name}", debt.clientName)
-          .replace("{contract}", debt.contractNumber ?? "—")
-          .replace("{amount}", formatCurrency(debt.totalOverdue, debt.currency))
-          .replace("{days}", String(debt.daysOverdue))
-      )}
+      href={waLink(debt.clientPhone, reminderText([debt], t))}
       target="_blank"
       rel="noopener noreferrer"
       title={t.debtors.whatsapp}
@@ -125,9 +101,7 @@ function WhatsAppLink({ debt, t, block = false }: { debt: ContractDebt; t: Dicti
         block ? "flex-1" : ""
       }`}
     >
-      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 fill-current" aria-hidden="true">
-        <path d="M12 2a10 10 0 0 0-8.6 15.1L2 22l5-1.3A10 10 0 1 0 12 2Zm5.3 14.1c-.2.6-1.2 1.2-1.7 1.2-.4.1-1 .1-1.6-.1a13 13 0 0 1-1.5-.5c-2.6-1.1-4.3-3.7-4.4-3.9-.1-.2-1-1.4-1-2.6s.6-1.8.9-2c.2-.3.5-.3.7-.3h.5c.2 0 .4 0 .6.4l.9 2.1c0 .2.1.3 0 .5l-.3.5-.4.5c-.2.1-.3.3-.1.6.1.3.7 1.1 1.4 1.8.9.9 1.7 1.1 2 1.3.2.1.4.1.6-.1l.8-1c.2-.3.4-.2.6-.1l2 .9c.2.1.4.2.4.3.1.1.1.6-.1 1.1Z" />
-      </svg>
+      <WhatsAppIcon className="h-3.5 w-3.5" />
       {t.debtors.whatsapp}
     </a>
   );
@@ -151,14 +125,59 @@ function paymentsWord(debt: ContractDebt, t: Dictionary) {
   return `${debt.missedCount} ${debt.missedCount === 1 ? t.debtors.missedOne : t.debtors.missedPayments}`;
 }
 
+// A debtor who has not paid for more than a month has missed a whole cycle;
+// before that, a reminder alone usually fixes it. Drives the badge colour.
+const ONE_CYCLE_DAYS = 31;
+
+function elapsedWords(t: Dictionary): ElapsedWords {
+  return { years: t.debtors.yearsShort, months: t.debtors.monthsShort, days: t.debtors.days, today: t.debtors.today };
+}
+
+// "Подъезд 2, 5 этаж, квартира 34" -- where the flat is. The number is worked out from
+// the building's grid, so it is missing until the grid has been read.
+function placeOf(r: ContractDebt, flatNumbers: Map<string, number>, t: Dictionary): string {
+  return unitLabel(
+    { name: r.objectName, block: r.objectBlock, floor: r.objectFloor },
+    r.objectId ? flatNumbers.get(r.objectId) : undefined,
+    t.buildings
+  );
+}
+
+// Date of the last REAL payment and how long ago that was -- the whole gap, not a
+// running tally of missed instalments.
+function LastPaymentCell({ debt, t, inline = false }: { debt: ContractDebt; t: Dictionary; inline?: boolean }) {
+  const gap = elapsedSince(debt.lastPaymentDate);
+  const long = !gap || gap.totalDays > ONE_CYCLE_DAYS;
+  const tone = long
+    ? "bg-[var(--wash-rose)] text-[var(--wash-rose-ink)]"
+    : "bg-[var(--wash-amber)] text-[var(--wash-amber-ink)]";
+  const badge = gap
+    ? gap.totalDays === 0
+      ? t.debtors.today
+      : `${formatElapsed(gap, elapsedWords(t))} ${t.debtors.ago}`
+    : t.debtors.noPayments;
+  return (
+    <div className={inline ? "flex flex-wrap items-center gap-x-2 gap-y-1" : "flex flex-col items-start gap-1"}>
+      {debt.lastPaymentDate && (
+        <span className="text-[var(--ink-3)]">{formatShortDate(debt.lastPaymentDate)}</span>
+      )}
+      <span className={`inline-flex items-center whitespace-nowrap rounded-full px-1.5 py-0.5 text-xs font-medium ${tone}`}>
+        {badge}
+      </span>
+    </div>
+  );
+}
+
 // Desktop: a table, one row per contract, the colour of the age on its edge.
 export function DebtorTable({
   rows,
   loading,
+  flatNumbers,
   t,
 }: {
   rows: ContractDebt[];
   loading: boolean;
+  flatNumbers: Map<string, number>;
   t: Dictionary;
 }) {
   return (
@@ -169,6 +188,7 @@ export function DebtorTable({
             <th className="py-3 pl-5 pr-4 font-semibold">{t.debtors.client}</th>
             <th className="px-4 py-3 font-semibold">{t.debtors.object}</th>
             <th className="px-4 py-3 font-semibold">{t.debtors.overdue}</th>
+            <th className="px-4 py-3 font-semibold">{t.debtors.lastPayment}</th>
             <th className="px-4 py-3 text-right font-semibold">{t.debtors.overdueNow}</th>
             <th className="px-4 py-3 text-right font-semibold">{t.debtors.remainingCol}</th>
             <th className="py-3 pl-4 pr-5" />
@@ -177,14 +197,14 @@ export function DebtorTable({
         <tbody>
           {loading && (
             <tr>
-              <td colSpan={6} className="px-4 py-8 text-center text-[var(--ink-5)]">
+              <td colSpan={7} className="px-4 py-8 text-center text-[var(--ink-5)]">
                 {t.common.loading}
               </td>
             </tr>
           )}
           {!loading && rows.length === 0 && (
             <tr>
-              <td colSpan={6} className="px-4 py-10 text-center text-[var(--wash-emerald-ink)]">
+              <td colSpan={7} className="px-4 py-10 text-center text-[var(--wash-emerald-ink)]">
                 {t.debtors.empty}
               </td>
             </tr>
@@ -201,7 +221,8 @@ export function DebtorTable({
                 )}
               </td>
               <td className="px-4 py-3.5">
-                <div className="font-medium text-[var(--ink-2)]">{r.objectName ?? "—"}</div>
+                {r.buildingName && <div className="font-medium text-[var(--ink-2)]">{r.buildingName}</div>}
+                <div className="text-xs text-[var(--ink-4)]">{placeOf(r, flatNumbers, t)}</div>
                 {r.contractNumber && (
                   <div className="text-xs text-[var(--ink-5)]">№{r.contractNumber}</div>
                 )}
@@ -209,12 +230,20 @@ export function DebtorTable({
               <td className="px-4 py-3.5">
                 <AgeBadge debt={r} t={t} />
               </td>
+              <td className="px-4 py-3.5">
+                <LastPaymentCell debt={r} t={t} />
+              </td>
               {/* Amount first, then how many payments make it up, spelled out. */}
               <td className="px-4 py-3.5 text-right">
                 <div className="text-[15px] font-bold tabular-nums text-[var(--wash-rose-ink)]">
                   {formatCurrency(r.totalOverdue, r.currency)}
                 </div>
                 <div className="text-xs text-[var(--ink-5)]">{paymentsWord(r, t)}</div>
+                {r.monthlyPayment != null && (
+                  <div className="text-xs text-[var(--ink-5)]">
+                    {t.debtors.monthlyPayment}: {formatCurrency(r.monthlyPayment, r.currency)}
+                  </div>
+                )}
               </td>
               <td className="px-4 py-3.5 text-right tabular-nums text-[var(--ink-2)]">
                 {formatCurrency(r.remainingTotal, r.currency)}
@@ -255,10 +284,12 @@ export function DebtorTable({
 export function DebtorCards({
   rows,
   loading,
+  flatNumbers,
   t,
 }: {
   rows: ContractDebt[];
   loading: boolean;
+  flatNumbers: Map<string, number>;
   t: Dictionary;
 }) {
   return (
@@ -285,8 +316,12 @@ export function DebtorCards({
                 <div className="text-xs tabular-nums text-[var(--ink-5)]">{r.clientPhone}</div>
               )}
               <div className="mt-1 text-xs text-[var(--ink-4)]">
-                {r.objectName ?? "—"}
+                {[r.buildingName, placeOf(r, flatNumbers, t)].filter(Boolean).join(" · ")}
                 {r.contractNumber ? ` · №${r.contractNumber}` : ""}
+              </div>
+              <div className="mt-1.5 flex flex-wrap items-center gap-x-2 text-xs text-[var(--ink-4)]">
+                <span>{t.debtors.lastPayment}:</span>
+                <LastPaymentCell debt={r} t={t} inline />
               </div>
             </div>
             <AgeBadge debt={r} t={t} />
@@ -300,6 +335,11 @@ export function DebtorCards({
                 {paymentsWord(r, t)} · {t.debtors.remainingCol}:{" "}
                 {formatCurrency(r.remainingTotal, r.currency)}
               </div>
+              {r.monthlyPayment != null && (
+                <div className="text-xs text-[var(--ink-5)]">
+                  {t.debtors.monthlyPayment}: {formatCurrency(r.monthlyPayment, r.currency)}
+                </div>
+              )}
             </div>
           </div>
           <div className="flex gap-2">
@@ -320,23 +360,20 @@ export function DebtorCards({
 }
 
 // One card per currency (TJS and USD share no axis, so they never share a
-// number): the headline is what is overdue right now, the bar says how much of
-// the whole outstanding balance that is, and the buildings underneath say where
-// it sits.
+// number): the headline is what is overdue right now, and the bar says how much of
+// the whole outstanding balance that is. (A per-building bar chart used to sit
+// underneath -- overdue drawn inside the whole balance of each ЖК -- and was read as
+// noise; the list below can be filtered by ЖК instead.)
 export function DebtSummary({
   currency,
   total,
-  buildings,
   t,
 }: {
   currency: Currency;
-  total: { overdue: number; remaining: number; contracts: number } | null;
-  buildings: Array<{ name: string; overdue: number; remaining: number; contracts: number }>;
+  total: { overdue: number; remaining: number; contracts: number };
   t: Dictionary;
 }): ReactNode {
-  const overdue = total?.overdue ?? buildings.reduce((sum, b) => sum + b.overdue, 0);
-  const remaining = total?.remaining ?? buildings.reduce((sum, b) => sum + b.remaining, 0);
-  const contracts = total?.contracts ?? buildings.reduce((sum, b) => sum + b.contracts, 0);
+  const { overdue, remaining, contracts } = total;
   const share = remaining > 0 ? Math.min(100, Math.round((overdue / remaining) * 100)) : 0;
 
   return (
@@ -378,26 +415,6 @@ export function DebtSummary({
           </span>
         </p>
       </div>
-
-      {buildings.length > 0 && (
-        <div className="border-t border-[var(--border-c2)] pt-3.5">
-          <p className="mb-3 text-[11px] font-semibold uppercase tracking-[0.1em] text-[var(--ink-4)]">
-            {t.debtors.chartTitle}
-          </p>
-          <HBarChart
-            data={buildings.map((b) => ({
-              label: b.name,
-              value: b.overdue,
-              // Track sized to the whole remaining balance, overdue filled in
-              // as a share of it.
-              total: b.remaining > 0 ? b.remaining : b.overdue,
-              hue: STATUS_HUES.sold,
-              hint: `${t.debtors.debtorsCount}: ${b.contracts}`,
-            }))}
-            formatValue={(n) => formatCurrency(n, currency)}
-          />
-        </div>
-      )}
     </div>
   );
 }

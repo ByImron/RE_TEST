@@ -10,8 +10,10 @@ import { ArrowDownLeftIcon, ArrowUpRightIcon } from "@/components/icons";
 import { CURRENCIES, type Currency } from "@/lib/currency";
 import { MIN_BUSINESS_DATE, isDateInRange, yearsAheadISO } from "@/lib/dates";
 import { localISO } from "@/lib/finance/period";
-import { MAX_CENTS, parseScaled, scaledToPlain } from "@/lib/finance/money";
+import { MAX_CENTS, formatCents, parseScaled, scaledToPlain } from "@/lib/finance/money";
+import { describeFundsError } from "@/lib/finance/errors";
 import type { AdvancePerson } from "@/lib/finance/types";
+import { useFinance } from "@/components/finance/FinanceContext";
 
 const FIELD =
   "h-[42px] w-full rounded-lg border border-[var(--field-border)] bg-[var(--field-bg)] px-3 text-sm text-[var(--ink-1)] transition-colors";
@@ -37,6 +39,7 @@ export function AdvanceModal({
 }) {
   const { t } = useLocale();
   const once = useSingleFlight();
+  const { funds } = useFinance();
   // Saving twice with the same id is a duplicate-key error, read as "already saved".
   const draftId = useRef<string>(newId());
 
@@ -51,9 +54,27 @@ export function AdvanceModal({
 
   const cents = parseScaled(amount, 2);
 
+  // The limit of THIS operation, in the chosen currency: issuing is bounded by
+  // the till, taking money back by what the person actually holds. Unknown (the
+  // database is older than the guard) means no limit is shown -- the database
+  // would still refuse an impossible one.
+  const person = people.find((p) => p.id === personId) ?? null;
+  const limit: number | null =
+    mode === "give"
+      ? (funds?.[currency]?.cash ?? null)
+      : person
+        ? (person.balances.find((b) => b.currency === currency)?.balance ?? 0)
+        : null;
+  const limitCents = limit === null ? null : BigInt(Math.round(Math.max(limit, 0) * 100));
+  const tooMuch = limitCents !== null && cents !== null && cents > limitCents;
+  const limitText = limitCents === null ? "" : `${formatCents(limitCents)} ${currency}`;
+
   const save = async () => {
     if (!personId) return setError(t.finance.advances.errPerson);
     if (cents === null || cents <= ZERO || cents >= MAX_CENTS) return setError(t.finance.advances.errAmount);
+    if (tooMuch) {
+      return setError((mode === "give" ? t.finance.funds.giveExceeds : t.finance.funds.returnExceeds).replace("{sum}", limitText));
+    }
     if (!isDateInRange(date, MIN_BUSINESS_DATE, yearsAheadISO(1))) return setError(t.finance.form.errDate);
     setError(null);
     setSaving(true);
@@ -71,7 +92,7 @@ export function AdvanceModal({
       });
     setSaving(false);
     if (dbError && (dbError as { code?: string }).code !== "23505") {
-      setError(dbError.message);
+      setError(describeFundsError(dbError as { hint?: string | null; details?: string | null }, t.finance.funds) ?? dbError.message);
       return;
     }
     onSaved();
@@ -175,6 +196,21 @@ export function AdvanceModal({
           </div>
         </div>
 
+        {limit !== null && (
+          <p
+            aria-live="polite"
+            className={`-mt-1 text-xs font-medium ${tooMuch ? "text-[var(--wash-rose-ink)]" : "text-[var(--ink-4)]"}`}
+          >
+            {(mode === "give" ? t.finance.funds.giveAvailable : t.finance.funds.returnAvailable).replace("{sum}", limitText)}
+            {tooMuch && (
+              <span>
+                {" · "}
+                {(mode === "give" ? t.finance.funds.giveExceeds : t.finance.funds.returnExceeds).replace("{sum}", limitText)}
+              </span>
+            )}
+          </p>
+        )}
+
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label className="flex flex-col gap-1.5">
             <span className={LABEL}>{t.finance.form.date}</span>
@@ -211,7 +247,7 @@ export function AdvanceModal({
           <button type="button" onClick={onClose} className="btn btn-ghost btn-md max-sm:w-full">
             {t.common.cancel}
           </button>
-          <button type="submit" disabled={saving} className="btn btn-primary btn-md max-sm:w-full">
+          <button type="submit" disabled={saving || tooMuch} className="btn btn-primary btn-md max-sm:w-full">
             {mode === "give" ? t.finance.advances.saveGive : t.finance.advances.saveReturn}
           </button>
         </div>

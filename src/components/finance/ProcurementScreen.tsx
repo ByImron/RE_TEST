@@ -6,7 +6,9 @@ import { createClient } from "@/lib/supabase/client";
 import { useLocale } from "@/lib/i18n/LocaleProvider";
 import { useConfirm } from "@/components/ConfirmDialog";
 import { useSingleFlight } from "@/lib/useSingleFlight";
-import { LockIcon, PencilIcon, PlusIcon, TagIcon, TrashIcon } from "@/components/icons";
+import { LockIcon, PencilIcon, TagIcon, TrashIcon } from "@/components/icons";
+import { Toast } from "@/components/Toast";
+import { PulsingFab } from "@/components/finance/PulsingFab";
 import { formatShortDate } from "@/lib/formatDate";
 import { categoryLabel, type FinanceEntry, type PersonBalance } from "@/lib/finance/types";
 import { useFinance } from "@/components/finance/FinanceContext";
@@ -34,8 +36,9 @@ export function ProcurementHome() {
   const router = useRouter();
   const confirm = useConfirm();
   const once = useSingleFlight();
-  const { buildings, version, bump, editor, openEntry, editEntry, closeEditor, setupMissing } =
+  const { buildings, version, bump, editor, openEntry, editEntry, closeEditor, setupMissing, spendLocked } =
     useFinance();
+  const [lockedToast, setLockedToast] = useState<string | null>(null);
 
   const [rows, setRows] = useState<Row[]>([]);
   const [limit, setLimit] = useState(PAGE);
@@ -155,6 +158,21 @@ export function ProcurementHome() {
         })}
       </section>
 
+      {/* No money in hand: the button below is locked, and this says why and what
+          to do -- nothing about it is hidden or silently dead. */}
+      {spendLocked && (
+        <div
+          role="status"
+          className="flex items-start gap-3 rounded-2xl border border-[var(--wash-rose-border)] bg-[var(--wash-rose)] p-4 text-[var(--wash-rose-ink)]"
+        >
+          <LockIcon className="mt-0.5 h-5 w-5 shrink-0" />
+          <div className="min-w-0">
+            <p className="text-sm font-semibold">{t.finance.funds.lockedTitle}</p>
+            <p className="mt-0.5 text-xs leading-snug">{t.finance.funds.lockedBodyPersonal}</p>
+          </div>
+        </div>
+      )}
+
       {failure && (
         <p role="alert" className="rounded-lg bg-[var(--wash-rose)] px-4 py-3 text-sm text-[var(--wash-rose-ink)]">
           {failure}
@@ -209,15 +227,17 @@ export function ProcurementHome() {
       )}
 
       {/* The one action of this screen: under the thumb, clear of the home
-          indicator, never covered by the list. */}
-      <button
-        type="button"
-        onClick={() => openEntry("expense")}
-        aria-label={t.finance.procurement.add}
-        className="fixed bottom-[calc(1.25rem+env(safe-area-inset-bottom))] right-5 z-30 flex h-16 w-16 touch-manipulation items-center justify-center rounded-full bg-[var(--accent-yellow)] text-[#18181b] shadow-lg ring-1 ring-black/10 transition-transform duration-150 active:scale-95"
-      >
-        <PlusIcon className="h-7 w-7" />
-      </button>
+          indicator, never covered by the list. A yellow circle with a plus that
+          pulses softly; with no money in hand it becomes a grey padlock that
+          still answers when pressed. */}
+      <PulsingFab
+        size="lg"
+        label={spendLocked ? t.finance.funds.fabLocked : t.finance.procurement.add}
+        locked={spendLocked}
+        onClick={() => (spendLocked ? setLockedToast(t.finance.funds.fabLocked) : openEntry("expense"))}
+        className="bottom-[calc(1.25rem+env(safe-area-inset-bottom))] right-5"
+      />
+      <Toast message={lockedToast} type="error" onDismiss={() => setLockedToast(null)} />
 
       {editor && <EntryModal entry={editor.entry} initialKind="expense" onClose={closeEditor} />}
     </div>

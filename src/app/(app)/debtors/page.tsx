@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { isSupabaseConfigured } from "@/lib/supabase/isConfigured";
 import { useLocale } from "@/lib/i18n/LocaleProvider";
@@ -8,81 +8,33 @@ import { SetupNotice } from "@/components/SetupNotice";
 import { Pagination } from "@/components/Pagination";
 import type { Currency } from "@/lib/currency";
 import { ExportMenu } from "@/components/ExportMenu";
+import { WhatsAppAllAction } from "@/components/DebtorsWhatsApp";
 import {
   Chip,
   ChipGroup,
+  ControlGroup,
   FILTER_SELECT,
   FilterMenu,
   FilterSection,
   ListToolbar,
   type ActiveFilter,
 } from "@/components/ActionBar";
+import { DebtLegend, DebtSummary, DebtorCards, DebtorTable } from "@/components/DebtorList";
 import {
-  DebtLegend,
-  DebtSummary,
-  DebtorCards,
-  DebtorTable,
+  DEBT_SORTS,
+  fetchAllDebtors,
+  toDebt,
   type ContractDebt,
-} from "@/components/DebtorList";
+  type DebtSortKey,
+  type OverdueRow,
+} from "@/lib/debtors/debtors";
+import { buildCallList, callListHeaders, loadFlatInfo } from "@/lib/debtors/callList";
 import { PageTitle } from "@/components/PageTitle";
 import { ShiftedSchedules } from "@/components/ShiftedSchedules";
+import { DueThisMonthChart } from "@/components/DueThisMonthChart";
+import { useApartmentNumbers } from "@/lib/buildings/useApartmentNumbers";
 
 const PAGE_SIZE = 25;
-// Batch size for the "export everything" path -- PostgREST will not hand back
-// more than this in one response anyway.
-const EXPORT_BATCH = 1000;
-
-type SortKey = "freshest" | "overdue" | "oldest" | "name";
-
-// Which column each choice orders by, applied in the database so the order
-// holds across pages.
-const SORTS: Record<SortKey, { column: string; ascending: boolean }> = {
-  // Most recently missed payment first -- who fell behind TODAY, then
-  // yesterday, then a few days ago. These are the calls most worth making
-  // first: still fresh enough that a reminder alone often fixes it, before
-  // it drifts into "oldest" territory further down the list.
-  freshest: { column: "latest_due", ascending: false },
-  overdue: { column: "total_overdue", ascending: false },
-  oldest: { column: "earliest_due", ascending: true },
-  name: { column: "client_name", ascending: true },
-};
-
-// A row exactly as crm.overdue_contracts() returns it.
-type OverdueRow = {
-  contract_id: string;
-  contract_number: string | null;
-  client_id: string | null;
-  client_name: string;
-  client_phone: string | null;
-  object_name: string | null;
-  currency: Currency;
-  missed_count: number;
-  total_overdue: number;
-  remaining_total: number | null;
-  earliest_due: string;
-  latest_due: string;
-};
-
-// Same shape the table renders, built from one RPC row.
-function toDebt(r: OverdueRow, now: number): ContractDebt {
-  return {
-    contractId: r.contract_id,
-    clientId: r.client_id,
-    clientName: r.client_name,
-    clientPhone: r.client_phone,
-    objectName: r.object_name,
-    contractNumber: r.contract_number,
-    currency: r.currency,
-    missedCount: r.missed_count,
-    totalOverdue: Number(r.total_overdue),
-    remainingTotal: Number(r.remaining_total ?? 0),
-    earliestDue: r.earliest_due,
-    latestDue: r.latest_due,
-    // Measured from the LATEST missed date, so it reflects the current cycle
-    // and rolls forward each month instead of ballooning.
-    daysOverdue: Math.floor((now - new Date(r.latest_due).getTime()) / 86_400_000),
-  };
-}
 
 export default function DebtorsPage() {
   const { t } = useLocale();
@@ -96,14 +48,11 @@ export default function DebtorsPage() {
   // "freshest" (who just fell behind) rather than "by amount owed" -- the
   // list is a call queue, and the most recently missed payment is the one
   // worth acting on first.
-  const [sort, setSort] = useState<SortKey>("freshest");
+  const [sort, setSort] = useState<DebtSortKey>("freshest");
   // Filter by ЖК: collections are organised per development, so "show me only
   // this one" is the first thing anybody asks of this list.
   const [buildingId, setBuildingId] = useState<string>("all");
   const [buildings, setBuildings] = useState<Array<{ id: string; name: string }>>([]);
-  const [byBuilding, setByBuilding] = useState<
-    Array<{ name: string; overdue: number; remaining: number; contracts: number; currency: Currency }>
-  >([]);
   const [totalCount, setTotalCount] = useState(0);
   const [page, setPage] = useState(1);
   // Bumped after the administrator restores a schedule: the list, the totals and
@@ -132,7 +81,7 @@ export default function DebtorsPage() {
     if (!configured) return;
     let cancelled = false;
     const from = (page - 1) * PAGE_SIZE;
-    const order = SORTS[sort];
+    const order = DEBT_SORTS[sort];
     createClient()
       .schema("crm")
       .rpc("overdue_contracts", { p_building_id: buildingId === "all" ? null : buildingId }, { count: "exact" })
@@ -140,7 +89,7 @@ export default function DebtorsPage() {
       // 25 rows on screen would be a different list on every page. contract_id
       // second: without a unique tiebreaker, equal values can come back in a
       // different order per page, showing one debtor twice and another never.
-      .order(order.column, { ascending: order.ascending })
+      .order(order.column, { ascending: order.ascending, nullsFirst: order.nullsFirst })
       .order("contract_id", { ascending: true })
       .range(from, from + PAGE_SIZE - 1)
       .then(({ data, count, error }) => {
@@ -171,6 +120,10 @@ export default function DebtorsPage() {
       cancelled = true;
     };
   }, [configured, page, sort, buildingId, queryKey]);
+
+  // Flat numbers for the buildings on screen -- the list says "квартира 34", not just the
+  // stored "№6-4". The number is worked out from the building's grid, once per building.
+  const flatNumbers = useApartmentNumbers(rows.map((r) => r.buildingId));
 
   // The headline totals cover EVERY debtor, not the 25 on screen, so they come
   // from their own aggregate instead of being summed from `rows`.
@@ -208,92 +161,36 @@ export default function DebtorsPage() {
     };
   }, [configured, buildingId, reloadKey]);
 
-  // The chart shows every building regardless of the filter -- narrowing the
-  // list to one ЖК shouldn't hide the comparison that tells you which ЖК to
-  // narrow to. Fetched once.
+  // The ЖК filter lists every building, whatever is picked now. Fetched once.
   useEffect(() => {
     if (!configured) return;
     let cancelled = false;
-    const supabase = createClient();
-    Promise.all([
-      supabase.schema("crm").from("buildings").select("id, name").order("name"),
-      supabase.schema("crm").rpc("overdue_by_building"),
-    ]).then(([bRes, oRes]) => {
-      if (cancelled) return;
-      setBuildings((bRes.data ?? []) as Array<{ id: string; name: string }>);
-      if (oRes.error) {
-        console.error("overdue_by_building failed:", oRes.error.message);
-        return;
-      }
-      setByBuilding(
-        (
-          (oRes.data ?? []) as Array<{
-            building_name: string;
-            currency: Currency;
-            contracts: number;
-            total_overdue: number;
-            remaining_total: number | null;
-          }>
-        ).map((r) => ({
-          name: r.building_name,
-          currency: r.currency,
-          contracts: r.contracts,
-          overdue: Number(r.total_overdue),
-          remaining: Number(r.remaining_total ?? 0),
-        }))
-      );
-    });
+    createClient()
+      .schema("crm")
+      .from("buildings")
+      .select("id, name")
+      .order("name")
+      .then(({ data }) => {
+        if (!cancelled) setBuildings((data ?? []) as Array<{ id: string; name: string }>);
+      });
     return () => {
       cancelled = true;
     };
-  }, [configured, reloadKey]);
-
-  // Grouped by currency: one panel and one scale per currency, because TJS and
-  // USD on a shared axis compare nothing.
-  const byCurrency = useMemo(() => {
-    const seen: Currency[] = [];
-    for (const r of byBuilding) if (!seen.includes(r.currency)) seen.push(r.currency);
-    return seen.map((currency) => ({
-      currency,
-      rows: byBuilding.filter((r) => r.currency === currency),
-      total: totals.find((tt) => tt.currency === currency) ?? null,
-    }));
-  }, [byBuilding, totals]);
+  }, [configured]);
 
   const pageCount = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
 
-  // Export is the whole list, not the current page -- an Excel file of 25 rows
-  // out of 1200 would be quietly wrong in exactly the way this change exists
-  // to prevent. Fetched in batches on demand, only when the button is pressed.
-  const getExportRows = async () => {
-    const num = (n: number) => n.toFixed(2).replace(".", ",");
+  // The call list is the WHOLE list, not the current page -- an Excel file or a
+  // printed sheet of 25 rows out of 1200 would be quietly wrong in exactly the way
+  // paging exists to prevent. Read on demand, in the order and under the filter on
+  // screen (lib/debtors), with the flats' numbers/floors/areas looked up for the
+  // sheet. A failed flat lookup only leaves those details out.
+  const getCallList = async () => {
     const supabase = createClient();
-    const all: ContractDebt[] = [];
-    const now = Date.now();
-    for (let from = 0; ; from += EXPORT_BATCH) {
-      const { data, error } = await supabase
-        .schema("crm")
-        // The export follows the same filter as the list on screen -- a file
-        // covering every ЖК while the page shows one would disagree with what
-        // the person exporting it was looking at.
-        .rpc("overdue_contracts", { p_building_id: buildingId === "all" ? null : buildingId })
-        .range(from, from + EXPORT_BATCH - 1);
-      const batch = (data ?? []) as OverdueRow[];
-      if (error || batch.length === 0) break;
-      all.push(...batch.map((r) => toDebt(r, now)));
-      if (batch.length < EXPORT_BATCH) break;
-    }
-    return all.map((r) => [
-      r.clientName,
-      r.clientPhone ?? "",
-      r.objectName ?? "",
-      r.contractNumber ?? "",
-      r.earliestDue,
-      r.missedCount,
-      num(r.totalOverdue),
-      num(r.remainingTotal),
-      r.currency,
-    ]);
+    const debts = await fetchAllDebtors(supabase, { buildingId, sort });
+    const flats = await loadFlatInfo(supabase, debts).catch(() => new Map());
+    const list = buildCallList(debts, flats, t);
+    return { rows: list.rows, pdf: list.pdf };
   };
 
   const clearAllFilters = () => {
@@ -301,8 +198,9 @@ export default function DebtorsPage() {
     setSort("freshest");
     setPage(1);
   };
-  const sortLabels: Record<SortKey, string> = {
+  const sortLabels: Record<DebtSortKey, string> = {
     freshest: t.debtors.sortByFreshest,
+    lastPayment: t.debtors.sortByLastPayment,
     overdue: t.debtors.sortByOverdue,
     oldest: t.debtors.sortByOldest,
     name: t.debtors.sortByName,
@@ -340,57 +238,38 @@ export default function DebtorsPage() {
           <PageTitle>{t.debtors.title}</PageTitle>
           <p className="text-sm text-[var(--ink-4)]">{t.debtors.subtitle}</p>
         </div>
-        {totalCount > 0 && (
-          <ExportMenu
-            getData={getExportRows}
-            headers={[
-              t.debtors.client,
-              t.clients.table.phone,
-              t.debtors.object,
-              "№",
-              t.debtors.oldestDue,
-              t.debtors.missedPayments,
-              t.debtors.overdueNow,
-              t.debtors.remainingCol,
-              "Валюта",
-            ]}
-            filenameBase="debtors"
-            title={t.debtors.title}
-          />
-        )}
       </div>
 
       {!configured && <SetupNotice />}
 
-      <ShiftedSchedules onRestored={() => setReloadKey((k) => k + 1)} />
+      <ShiftedSchedules ready={configured && !loading} onRestored={() => setReloadKey((k) => k + 1)} />
 
       {failure && (
         <div className="rounded-lg border border-[var(--wash-rose-border)] bg-[var(--wash-rose)] px-4 py-3 text-sm text-[var(--wash-rose-ink)]">
-          <p className="font-semibold">{t.dashboard.summaryFailed}</p>
+          <p className="font-semibold">
+            {/statement timeout|canceling statement/i.test(failure) ? t.debtors.loadTimeout : t.dashboard.summaryFailed}
+          </p>
           <p className="mt-1 text-xs opacity-80">{failure}</p>
         </div>
       )}
 
       {/* One card PER CURRENCY, each on its own scale: TJS and USD compare
           nothing on a shared axis. Headline = overdue right now; the bar =
-          how much of the whole balance that is; the buildings say where. */}
-      {byCurrency.length > 0 && (
+          how much of the whole balance that is. */}
+      {totals.length > 0 && (
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          {byCurrency.map(({ currency, rows: cRows, total }) => (
-            <DebtSummary
-              key={currency}
-              currency={currency}
-              total={total}
-              buildings={cRows}
-              t={t}
-            />
+          {totals.map((tt) => (
+            <DebtSummary key={tt.currency} currency={tt.currency} total={tt} t={t} />
           ))}
         </div>
       )}
 
+      {/* Who has to pay THIS month, per ЖК -- the forward-looking counterpart of the arrears above. */}
+      <DueThisMonthChart />
+
       {/* Building + sort order in one funnel, like every other list page. */}
       {(totalCount > 0 || activeFilters.length > 0) && (
-        <ListToolbar filters={activeFilters} onClearAll={clearAllFilters} clearLabel={t.common.resetFilters}>
+        <ListToolbar sticky={false} filters={activeFilters} onClearAll={clearAllFilters} clearLabel={t.common.resetFilters}>
           <FilterMenu
             label={t.common.filter}
             activeCount={(buildingId !== "all" ? 1 : 0) + (sort !== "freshest" ? 1 : 0)}
@@ -424,10 +303,11 @@ export default function DebtorsPage() {
                 {(
                   [
                     ["freshest", t.debtors.sortByFreshest],
+                    ["lastPayment", t.debtors.sortByLastPayment],
                     ["overdue", t.debtors.sortByOverdue],
                     ["oldest", t.debtors.sortByOldest],
                     ["name", t.debtors.sortByName],
-                  ] as Array<[SortKey, string]>
+                  ] as Array<[DebtSortKey, string]>
                 ).map(([key, label]) => (
                   <Chip
                     key={key}
@@ -442,12 +322,29 @@ export default function DebtorsPage() {
               </ChipGroup>
             </FilterSection>
           </FilterMenu>
+          {/* The two things to do with the WHOLE list, in one box beside the filter: hand
+              it over as a call sheet (PDF / Excel), or message everyone in WhatsApp. Both
+              read the list under the filter and sort on screen. */}
+          {totalCount > 0 && (
+            <ControlGroup>
+              <WhatsAppAllAction buildingId={buildingId} sort={sort} />
+              <ExportMenu
+                bare
+                getData={getCallList}
+                headers={callListHeaders(t)}
+                filenameBase="debtors"
+                title={t.debtors.call.title}
+                label={t.debtors.call.button}
+                pdfLabel={t.debtors.call.pdf}
+              />
+            </ControlGroup>
+          )}
         </ListToolbar>
       )}
 
       {rows.length > 0 && <DebtLegend t={t} />}
-      <DebtorTable rows={rows} loading={loading} t={t} />
-      <DebtorCards rows={rows} loading={loading} t={t} />
+      <DebtorTable rows={rows} loading={loading} flatNumbers={flatNumbers} t={t} />
+      <DebtorCards rows={rows} loading={loading} flatNumbers={flatNumbers} t={t} />
 
       <Pagination page={page} pageCount={pageCount} onPageChange={setPage} />
     </div>

@@ -26,7 +26,12 @@ import { categoryLabel, type FinanceEntry, type FinanceKind } from "@/lib/financ
 import { useFinance } from "@/components/finance/FinanceContext";
 import { CategoriesModal } from "@/components/finance/CategoriesModal";
 import { Money, toneFor } from "@/components/finance/FinanceParts";
-import { FinanceFilter, useCommonFilterState } from "@/components/finance/FinanceToolbarParts";
+import {
+  AddEntryAction,
+  FinanceFilter,
+  FinanceTabs,
+  useCommonFilterState,
+} from "@/components/finance/FinanceToolbarParts";
 
 // The journal is read a page at a time and never counted: with tens of
 // thousands of entries a running "page 7 of 900" (an OFFSET plus an exact
@@ -247,6 +252,7 @@ export default function FinanceEntriesPage() {
       {!configured && <SetupNotice />}
 
       <ListToolbar filters={activeFilters} onClearAll={resetAll} clearLabel={t.common.resetFilters}>
+        <FinanceTabs />
         <ExpandSearch value={searchInput} onChange={setSearchInput} placeholder={t.finance.search} />
         <FinanceFilter
           extraCount={(kind !== "all" ? 1 : 0) + (categoryId !== "all" ? 1 : 0)}
@@ -317,6 +323,8 @@ export default function FinanceEntriesPage() {
               />
             </>
           )}
+          {/* export and the categories, then the page's one yellow "+" glued on, as on the clients page */}
+          <AddEntryAction divider />
         </ControlGroup>
       </ListToolbar>
 

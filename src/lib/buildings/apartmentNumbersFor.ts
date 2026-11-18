@@ -41,18 +41,26 @@ async function unitsOfBuilding(
   return all;
 }
 
+/** building id → every unit in it (paged past PostgREST's 1000-row cap). */
+export async function unitsOfBuildings(
+  supabase: SupabaseClient,
+  buildingIds: Array<string | null | undefined>
+): Promise<Map<string, PropertyObject[]>> {
+  const ids = [...new Set(buildingIds.filter((id): id is string => Boolean(id)))];
+  const out = new Map<string, PropertyObject[]>();
+  await Promise.all(ids.map(async (id) => out.set(id, await unitsOfBuilding(supabase, id))));
+  return out;
+}
+
 /** unit id → flat number, for every unit of the given buildings. */
 export async function apartmentNumbersForBuildings(
   supabase: SupabaseClient,
   buildingIds: Array<string | null | undefined>
 ): Promise<Map<string, number>> {
-  const ids = [...new Set(buildingIds.filter((id): id is string => Boolean(id)))];
   const out = new Map<string, number>();
-  await Promise.all(
-    ids.map(async (id) => {
-      const numbers = computeApartmentNumbers(await unitsOfBuilding(supabase, id));
-      for (const [unitId, n] of numbers) out.set(unitId, n);
-    })
-  );
+  // Numbering is per building (see above), so each building's units are numbered on their own.
+  for (const units of (await unitsOfBuildings(supabase, buildingIds)).values()) {
+    for (const [unitId, n] of computeApartmentNumbers(units)) out.set(unitId, n);
+  }
   return out;
 }

@@ -26,3 +26,14 @@ export function smsGatewayPhone(phone: string | null | undefined): string {
   const digits = normalizeTjPhone(phone);
   return digits ? `+${digits}` : "";
 }
+
+// Can this number be opened in WhatsApp at all? WhatsApp has no way to ask
+// "does this number have an account" without sending, so this only rules out what
+// can never work: nothing typed, or too few/many digits to be an international
+// number (a stray "12" or a pasted passport number). A Tajik mobile number in any
+// of its written forms comes out as 992 + 9 digits = 12; the loose 11-15 window
+// lets other countries' numbers through.
+export function isWhatsAppPhone(phone: string | null | undefined): boolean {
+  const digits = normalizeTjPhone(phone);
+  return digits.length >= 11 && digits.length <= 15;
+}

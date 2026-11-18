@@ -5,12 +5,13 @@ import { createClient } from "@/lib/supabase/client";
 import { isSupabaseConfigured } from "@/lib/supabase/isConfigured";
 import { useLocale } from "@/lib/i18n/LocaleProvider";
 import { useConfirm } from "@/components/ConfirmDialog";
-import { IconAction, TrashAction } from "@/components/ActionBar";
+import { Chip, ChipGroup, IconAction, ListToolbar, TrashAction } from "@/components/ActionBar";
 import { ArrowDownLeftIcon, ArrowUpRightIcon, PencilIcon, TagIcon } from "@/components/icons";
 import { formatShortDate } from "@/lib/formatDate";
 import type { AdvancePerson, FinanceEntry, LedgerEvent } from "@/lib/finance/types";
 import { categoryLabel } from "@/lib/finance/types";
 import { useFinance } from "@/components/finance/FinanceContext";
+import { AddEntryGroup, FinanceTabs } from "@/components/finance/FinanceToolbarParts";
 import { AdvanceModal } from "@/components/finance/AdvanceModal";
 import { Money, toneFor } from "@/components/finance/FinanceParts";
 
@@ -61,6 +62,12 @@ export default function FinanceAdvancesPage() {
 
   return (
     <div className="flex flex-col gap-5">
+      {/* the same toolbar row as the other two parts */}
+      <ListToolbar sticky={false}>
+        <FinanceTabs />
+        <AddEntryGroup />
+      </ListToolbar>
+
       {loadFailed && (
         <p role="alert" className="rounded-lg bg-[var(--wash-rose)] px-4 py-3 text-sm text-[var(--wash-rose-ink)]">
           {t.finance.loadFailed}
@@ -141,18 +148,22 @@ function PersonPanel({
   const confirm = useConfirm();
 
   const [rows, setRows] = useState<LedgerEvent[]>([]);
+  // Which part of the person's history to show. The list below mixes issues, returns and
+  // hundreds of expenses by date; "only what was handed over" is one tap.
+  const [kind, setKind] = useState<"all" | "advances" | "expenses">("all");
+  const kindParam = kind === "all" ? {} : { p_kind: kind };
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [loadedKey, setLoadedKey] = useState<string | null>(null);
-  const queryKey = `${person.id}|${version}`;
+  const queryKey = `${person.id}|${version}|${kind}`;
   const loading = loadedKey !== queryKey;
 
   useEffect(() => {
     let cancelled = false;
     createClient()
       .schema("crm")
-      .rpc("finance_person_ledger", { p_person_id: person.id, p_limit: PAGE + 1 })
+      .rpc("finance_person_ledger", { p_person_id: person.id, p_limit: PAGE + 1, ...kindParam })
       .then(({ data, error }) => {
         if (cancelled) return;
         if (error) {
@@ -168,9 +179,10 @@ function PersonPanel({
     return () => {
       cancelled = true;
     };
-    // queryKey is derived from person.id and version, both already listed.
+    // queryKey is derived from person.id, version and kind, all already listed
+    // (kindParam is derived from kind).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [person.id, version]);
+  }, [person.id, version, kind]);
 
   const loadMore = async () => {
     const last = rows[rows.length - 1];
@@ -184,6 +196,7 @@ function PersonPanel({
         p_before_created_at: last.created_at,
         p_before_id: last.id,
         p_limit: PAGE + 1,
+        ...kindParam,
       });
     setLoadingMore(false);
     if (error) {
@@ -245,11 +258,32 @@ function PersonPanel({
                 <p className={`text-[26px] font-bold leading-tight ${toneFor(b.balance)}`}>
                   <Money value={b.balance} currency={b.currency} signed />
                 </p>
-                <p className="text-xs text-[var(--ink-5)]">
-                  {t.finance.advances.issuedSpent
-                    .replace("{issued}", `${new Intl.NumberFormat("ru-RU").format(b.issued)} ${b.currency}`)
-                    .replace("{spent}", `${new Intl.NumberFormat("ru-RU").format(b.spent)} ${b.currency}`)}
-                </p>
+                {b.given !== undefined && b.returned !== undefined ? (
+                  // handed over, taken back, spent -- three separate figures; "on hand" above is
+                  // what is left of them
+                  <dl className="mt-1.5 grid grid-cols-3 gap-x-4 text-xs">
+                    {(
+                      [
+                        [t.finance.advances.given, b.given],
+                        [t.finance.advances.returned, b.returned],
+                        [t.finance.advances.spent, b.spent],
+                      ] as const
+                    ).map(([label, value]) => (
+                      <div key={label}>
+                        <dt className="text-[var(--ink-5)]">{label}</dt>
+                        <dd className="font-semibold tabular-nums text-[var(--ink-2)]">
+                          {new Intl.NumberFormat("ru-RU").format(value)} {b.currency}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                ) : (
+                  <p className="text-xs text-[var(--ink-5)]">
+                    {t.finance.advances.issuedSpent
+                      .replace("{issued}", `${new Intl.NumberFormat("ru-RU").format(b.issued)} ${b.currency}`)
+                      .replace("{spent}", `${new Intl.NumberFormat("ru-RU").format(b.spent)} ${b.currency}`)}
+                  </p>
+                )}
               </div>
             ))
           )}
@@ -272,10 +306,29 @@ function PersonPanel({
         </p>
       )}
 
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold text-[var(--ink-2)]">{t.finance.advances.history}</h2>
+        <ChipGroup>
+          <Chip label={t.finance.advances.filterAll} active={kind === "all"} onClick={() => setKind("all")} />
+          <Chip
+            label={t.finance.advances.filterAdvances}
+            active={kind === "advances"}
+            onClick={() => setKind("advances")}
+          />
+          <Chip
+            label={t.finance.advances.filterExpenses}
+            active={kind === "expenses"}
+            onClick={() => setKind("expenses")}
+          />
+        </ChipGroup>
+      </div>
+
       <ul className={`${CARD} divide-y divide-[var(--border-c2)] overflow-hidden`}>
         {loading && <li className="px-5 py-8 text-center text-sm text-[var(--ink-5)]">{t.common.loading}</li>}
         {!loading && rows.length === 0 && (
-          <li className="px-5 py-8 text-center text-sm text-[var(--ink-5)]">{t.finance.advances.emptyHistory}</li>
+          <li className="px-5 py-8 text-center text-sm text-[var(--ink-5)]">
+            {kind === "all" ? t.finance.advances.emptyHistory : t.finance.advances.emptyFiltered}
+          </li>
         )}
         {rows.map((r) => (
           <LedgerRow
@@ -322,7 +375,10 @@ function LedgerRow({
         t.finance.noCategory
       )
     : null;
-  const primary = isExpense ? row.title || row.counterparty || category || t.finance.noCategory : row.title || t.finance.advances.give;
+  // An issue or a return with no note is named for what it is -- a return used to read "Выдать".
+  const primary = isExpense
+    ? row.title || row.counterparty || category || t.finance.noCategory
+    : row.title || (row.kind === "return" ? t.finance.advances.returnTitle : t.finance.advances.giveTitle);
   const secondary = [
     isExpense ? (category && category !== primary ? category : null) : null,
     isExpense ? row.building_name : null,

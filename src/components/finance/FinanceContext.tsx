@@ -14,7 +14,8 @@ import { isSupabaseConfigured } from "@/lib/supabase/isConfigured";
 import { useSearchParams } from "next/navigation";
 import { useAccess } from "@/lib/auth/useRole";
 import { periodRange, type DateRange, type PeriodPreset } from "@/lib/finance/period";
-import type { FinanceCategory, FinanceEntry, FinanceKind } from "@/lib/finance/types";
+import type { Currency } from "@/lib/currency";
+import type { FinanceCategory, FinanceEntry, FinanceKind, FundsRow } from "@/lib/finance/types";
 
 export type BuildingOption = { id: string; name: string };
 
@@ -48,6 +49,15 @@ type FinanceState = {
   closeEditor: () => void;
   /** Remembers the direction of the last saved entry: the next dialog opens on it. */
   rememberKind: (kind: FinanceKind) => void;
+  /**
+   * How much this person can still spend, per currency (the buyer's own money
+   * under report, or the company till for the accountant). null while unknown
+   * and when the database predates the no-overdraft guard -- nothing is then
+   * blocked on screen; the database stays the one that decides.
+   */
+  funds: Partial<Record<Currency, FundsRow>> | null;
+  /** Expenses are closed in EVERY currency: the add-expense door is shut. */
+  spendLocked: boolean;
 };
 
 const Ctx = createContext<FinanceState | null>(null);
@@ -82,6 +92,7 @@ export function FinanceProvider({ children }: { children: ReactNode }) {
   const [version, setVersion] = useState(0);
   const [catVersion, setCatVersion] = useState(0);
   const [editor, setEditor] = useState<FinanceState["editor"]>(null);
+  const [funds, setFunds] = useState<FinanceState["funds"]>(null);
   // The direction last used opens next time: bookkeeping comes in runs.
   const [lastKind, setLastKind] = useState<FinanceKind>("expense");
 
@@ -126,6 +137,39 @@ export function FinanceProvider({ children }: { children: ReactNode }) {
       cancelled = true;
     };
   }, [configured, catVersion]);
+
+  // The balance the "add expense" button is judged by. Re-read after every
+  // change (version), because every expense, income and advance moves it.
+  useEffect(() => {
+    if (!configured || !(canManageFinance || financeOwn)) return;
+    let cancelled = false;
+    createClient()
+      .schema("crm")
+      .rpc("finance_available")
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          // Function missing: the database has not been updated yet.
+          setFunds(null);
+          return;
+        }
+        const rows = (data ?? []) as FundsRow[];
+        setFunds(
+          rows.length === 0
+            ? null
+            : Object.fromEntries(rows.map((r) => [r.currency, { ...r, available: Number(r.available), cash: r.cash == null ? null : Number(r.cash) }]))
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [configured, canManageFinance, financeOwn, version]);
+
+  const spendLocked = useMemo(() => {
+    if (!funds) return false;
+    const rows = Object.values(funds).filter((r): r is FundsRow => !!r);
+    return rows.length > 0 && rows.every((r) => r.available <= 0.004);
+  }, [funds]);
 
   const bump = useCallback(() => setVersion((v) => v + 1), []);
   const reloadCategories = useCallback(() => setCatVersion((v) => v + 1), []);
@@ -179,6 +223,8 @@ export function FinanceProvider({ children }: { children: ReactNode }) {
     editEntry,
     closeEditor,
     rememberKind: setLastKind,
+    funds,
+    spendLocked,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

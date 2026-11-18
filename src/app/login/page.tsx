@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { isSupabaseConfigured } from "@/lib/supabase/isConfigured";
@@ -42,12 +42,66 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [resetting, setResetting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // "Forgot password": the same card turns into a small recovery form. The login IS
+  // the person's e-mail, so recovery is one field. `sentTo` is the address the last
+  // link was requested for; `cooldown` is the seconds before asking again (Supabase
+  // sends one recovery e-mail per address per minute).
+  const [mode, setMode] = useState<"signin" | "recover">("signin");
+  const [sentTo, setSentTo] = useState<string | null>(null);
+  const [cooldown, setCooldown] = useState(0);
+
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const id = window.setTimeout(() => setCooldown((s) => s - 1), 1000);
+    return () => window.clearTimeout(id);
+  }, [cooldown]);
+
+  const handleRecover = async () => {
+    setError("");
+    const address = email.trim();
+    if (!address) {
+      setError(t.login.resetEnterEmail);
+      return;
+    }
+    setSubmitting(true);
+    const supabase = createClient();
+    // For an address that has no account Supabase answers "ok" as well, so the form
+    // cannot be used to find out who works here. Only real failures come back as an
+    // error: too many requests, or the project has no mail sending set up -- the
+    // second one used to be swallowed and the person waited for a letter that was
+    // never going to come.
+    const { error: resetError } = await supabase.auth.resetPasswordForEmail(address, {
+      redirectTo: `${window.location.origin}/reset-password`,
+    });
+    setSubmitting(false);
+    if (resetError) {
+      if (resetError.status === 429 || resetError.code === "over_email_send_rate_limit") {
+        setCooldown(60);
+        setError(t.login.recoverRateLimited);
+      } else {
+        console.error("resetPasswordForEmail failed:", resetError.message);
+        setError(t.login.recoverFailed);
+      }
+      return;
+    }
+    setSentTo(address);
+    setCooldown(60);
+  };
+
+  const backToSignIn = () => {
+    setMode("signin");
+    setError("");
+    setSentTo(null);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!configured) return;
+    if (mode === "recover") {
+      void handleRecover();
+      return;
+    }
     setSubmitting(true);
     setError("");
     const supabase = createClient();
@@ -71,17 +125,23 @@ export default function LoginPage() {
   return (
     <LoginShell>
       <LoginCard onSubmit={handleSubmit}>
-        <LoginHeading title={t.login.title} subtitle={t.login.staffOnly} />
+        <LoginHeading
+          title={mode === "recover" ? t.login.recoverTitle : t.login.title}
+          subtitle={mode === "recover" ? undefined : t.login.staffOnly}
+        />
         {/* A deployment whose environment variables were never set: say so
             here, where the person is already looking, instead of letting the
             Supabase client throw and replace the whole screen with a blank
             error. Signing in is impossible either way, but this way the
             reason is on screen. */}
         {!configured && <SetupNotice />}
-        {reasonText && (
+        {mode === "signin" && reasonText && (
           <p role="status" className="rounded-lg bg-[var(--wash-amber)] px-3 py-2.5 text-sm text-[var(--wash-amber-ink)]">
             {reasonText}
           </p>
+        )}
+        {mode === "recover" && (
+          <p className="text-sm leading-relaxed text-slate-600">{t.login.recoverHint}</p>
         )}
 
         <label className="flex flex-col gap-1.5">
@@ -95,50 +155,58 @@ export default function LoginPage() {
             className={LOGIN_FIELD}
           />
         </label>
-        <label className="flex flex-col gap-1.5">
-          <span className={LOGIN_LABEL}>{t.login.password}</span>
-          <PasswordField
-            required
-            autoComplete="current-password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            className={LOGIN_FIELD}
-          />
-        </label>
-        {error && <p className="text-sm text-red-600">{error}</p>}
-        {notice && <p className="text-sm text-emerald-700">{notice}</p>}
+        {mode === "signin" && (
+          <label className="flex flex-col gap-1.5">
+            <span className={LOGIN_LABEL}>{t.login.password}</span>
+            <PasswordField
+              required
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className={LOGIN_FIELD}
+            />
+          </label>
+        )}
+        {error && (
+          <p role="alert" className="text-sm text-red-600">
+            {error}
+          </p>
+        )}
+        {mode === "recover" && sentTo && (
+          <p role="status" className="rounded-lg bg-[var(--wash-emerald)] px-3 py-2.5 text-sm text-[var(--wash-emerald-ink)]">
+            {t.login.recoverSentTo.replace("{email}", sentTo)}
+          </p>
+        )}
         <button
           type="submit"
-          disabled={submitting || !configured}
+          disabled={submitting || !configured || (mode === "recover" && cooldown > 0)}
           className="btn btn-yellow btn-lg mt-1"
         >
-          {submitting ? t.common.loading : t.login.submit}
+          {submitting
+            ? t.common.loading
+            : mode === "signin"
+              ? t.login.submit
+              : cooldown > 0
+                ? t.login.recoverWait.replace("{s}", String(cooldown))
+                : sentTo
+                  ? t.login.recoverResend
+                  : t.login.recoverSend}
         </button>
         <button
           type="button"
-          disabled={resetting || !configured}
-          onClick={async () => {
-            setError("");
-            setNotice("");
-            if (!configured) return;
-            if (!email.trim()) {
-              setError(t.login.resetEnterEmail);
-              return;
+          disabled={!configured}
+          onClick={() => {
+            if (mode === "signin") {
+              setMode("recover");
+              setError("");
+              setSentTo(null);
+            } else {
+              backToSignIn();
             }
-            setResetting(true);
-            const supabase = createClient();
-            // Sends only to addresses that exist in Supabase Auth; the
-            // wording never confirms whether an account exists, so the
-            // form can't be used to probe for staff e-mails.
-            await supabase.auth.resetPasswordForEmail(email.trim(), {
-              redirectTo: `${window.location.origin}/reset-password`,
-            });
-            setResetting(false);
-            setNotice(t.login.resetSent);
           }}
           className={LOGIN_LINK}
         >
-          {t.login.forgot}
+          {mode === "signin" ? t.login.forgot : `← ${t.login.recoverBack}`}
         </button>
       </LoginCard>
     </LoginShell>

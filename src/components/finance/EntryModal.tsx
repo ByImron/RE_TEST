@@ -7,7 +7,8 @@ import { createClient } from "@/lib/supabase/client";
 import { useLocale } from "@/lib/i18n/LocaleProvider";
 import { Modal } from "@/components/Modal";
 import { Toast } from "@/components/Toast";
-import { ArrowDownLeftIcon, ArrowUpRightIcon, PlusIcon } from "@/components/icons";
+import { ArrowDownLeftIcon, ArrowUpRightIcon, LockIcon, PlusIcon } from "@/components/icons";
+import { describeFundsError } from "@/lib/finance/errors";
 import { CURRENCIES, type Currency } from "@/lib/currency";
 import { MIN_BUSINESS_DATE, isDateInRange, yearsAheadISO } from "@/lib/dates";
 import { localISO } from "@/lib/finance/period";
@@ -52,10 +53,24 @@ export function EntryModal({
   // The id this dialog will give the entry. Saving twice with it is a
   // duplicate-key error, which we treat as "already saved" -- never a second row.
   const draftId = useRef<string>(newId());
-  const { categories, buildings, buildingId: filterBuilding, bump, createCategory, rememberKind, ownOnly } =
-    useFinance();
+  const {
+    categories,
+    buildings,
+    buildingId: filterBuilding,
+    bump,
+    createCategory,
+    rememberKind,
+    ownOnly,
+    funds,
+    spendLocked,
+  } = useFinance();
 
-  const [kind, setKind] = useState<FinanceKind>(entry?.kind ?? initialKind);
+  // With an empty till an expense cannot be saved, so a new dialog opens on the
+  // income side -- the thing that fixes it (someone who only buys has no income
+  // side; their button is locked before they get here).
+  const [kind, setKind] = useState<FinanceKind>(
+    entry?.kind ?? (initialKind === "expense" && spendLocked && !ownOnly ? "income" : initialKind)
+  );
   const [date, setDate] = useState(entry?.occurred_on ?? localISO(new Date()));
   const [title, setTitle] = useState(entry?.title ?? "");
   const [quantity, setQuantity] = useState(entry?.quantity != null ? String(entry.quantity) : "1");
@@ -64,7 +79,14 @@ export function EntryModal({
   const [price, setPrice] = useState(
     entry ? (entry.unit_price != null ? String(entry.unit_price) : String(entry.amount)) : ""
   );
-  const [currency, setCurrency] = useState<Currency>(entry?.currency ?? "TJS");
+  // A new expense starts in the currency there is money in: with no somoni left
+  // but some dollars, the form should not open on the one that cannot be saved.
+  const [currency, setCurrency] = useState<Currency>(() => {
+    if (entry) return entry.currency;
+    if (!funds || initialKind !== "expense") return "TJS";
+    const withMoney = CURRENCIES.find((c) => (funds[c]?.available ?? 0) > 0.004);
+    return (funds.TJS?.available ?? 0) > 0.004 ? "TJS" : (withMoney ?? "TJS");
+  });
   const [categoryId, setCategoryId] = useState(entry?.category_id ?? "");
   // Several buildings: the person chooses. One building: it is not a choice.
   const [buildingChoice, setBuildingChoice] = useState(
@@ -136,8 +158,20 @@ export function EntryModal({
       ? lineCents(qtyScaled, priceScaled)
       : null;
 
+  // Can this expense be paid? Judged only for a NEW expense: an edit may be of
+  // someone else's entry (the accountant correcting a buyer's), whose pot is not
+  // the one shown here -- the database checks edits and answers in words.
+  const fundsRow = !entry && kind === "expense" ? (funds?.[currency] ?? null) : null;
+  const availableCents = fundsRow ? BigInt(Math.round(Math.max(fundsRow.available, 0) * 100)) : null;
+  const noFunds = fundsRow !== null && availableCents === ZERO;
+  const overdraft =
+    fundsRow !== null && availableCents !== null && totalCents !== null && totalCents > availableCents;
+  const blocked = noFunds || overdraft;
+  const fmtAvailable = fundsRow ? `${formatCents(availableCents ?? ZERO)} ${currency}` : "";
+
   const switchKind = (next: FinanceKind) => {
     if (next === kind) return;
+    if (next === "expense" && spendLocked && !ownOnly && !entry) return;
     setKind(next);
     // A category belongs to one direction; do not carry it across.
     setCategoryId("");
@@ -180,6 +214,15 @@ export function EntryModal({
   };
 
   const save = async (addAnother: boolean) => {
+    if (noFunds) return setError(ownOnly ? t.finance.funds.lockedBodyPersonal : t.finance.funds.lockedBodyCompany);
+    if (overdraft) {
+      return setError(
+        (fundsRow?.scope === "personal" ? t.finance.funds.exceedsPersonal : t.finance.funds.exceeds).replace(
+          "{sum}",
+          fmtAvailable
+        )
+      );
+    }
     if (!title.trim() && !categoryId) return setError(t.finance.form.errTitleOrCategory);
     if (buildings.length > 1 && effectiveBuilding === undefined) return setError(t.finance.form.errBuilding);
     if (qtyScaled === null || qtyScaled <= ZERO) return setError(t.finance.form.errQuantity);
@@ -220,7 +263,9 @@ export function EntryModal({
     // 23505 = the entry with this dialog's id already exists: the first save went
     // through (a double click, a retry) -- that is success, not an error.
     if (dbError && (dbError as { code?: string }).code !== "23505") {
-      setError(dbError.message);
+      // A refused overdraft arrives with a machine-readable reason: say it in the
+      // reader's language rather than showing the database's Russian sentence.
+      setError(describeFundsError(dbError as { hint?: string | null; details?: string | null }, t.finance.funds) ?? dbError.message);
       return;
     }
     bump();
@@ -281,14 +326,19 @@ export function EntryModal({
             {(["expense", "income"] as const).map((k) => {
               const on = kind === k;
               const isIncome = k === "income";
+              const closed = !isIncome && spendLocked && !entry;
               return (
                 <button
                   key={k}
                   type="button"
                   onClick={() => switchKind(k)}
                   aria-pressed={on}
+                  aria-disabled={closed || undefined}
+                  title={closed ? t.finance.funds.closedHint : undefined}
                   className={`flex items-center gap-3 rounded-xl border-2 px-3 py-2.5 text-left transition-colors duration-150 ${
-                    on
+                    closed
+                      ? "cursor-not-allowed border-[var(--border-c)] bg-[var(--surface-2)] text-[var(--ink-5)]"
+                      : on
                       ? isIncome
                         ? "border-emerald-600 bg-emerald-600 text-white"
                         : "border-rose-600 bg-rose-600 text-white"
@@ -304,14 +354,14 @@ export function EntryModal({
                           : "bg-[var(--wash-rose)] text-[var(--wash-rose-ink)]"
                     }`}
                   >
-                    {isIncome ? <ArrowDownLeftIcon className="h-5 w-5" /> : <ArrowUpRightIcon className="h-5 w-5" />}
+                    {closed ? <LockIcon className="h-5 w-5" /> : isIncome ? <ArrowDownLeftIcon className="h-5 w-5" /> : <ArrowUpRightIcon className="h-5 w-5" />}
                   </span>
                   <span className="min-w-0">
                     <span className="block text-sm font-semibold leading-tight">
                       {isIncome ? t.finance.income : t.finance.expense}
                     </span>
                     <span className={`block text-[11px] leading-tight ${on ? "text-white/80" : "text-[var(--ink-5)]"}`}>
-                      {isIncome ? t.finance.form.kindIncomeHint : t.finance.form.kindExpenseHint}
+                      {closed ? t.finance.funds.kindClosed : isIncome ? t.finance.form.kindIncomeHint : t.finance.form.kindExpenseHint}
                     </span>
                   </span>
                 </button>
@@ -524,6 +574,53 @@ export function EntryModal({
             </p>
           </div>
 
+          {fundsRow && !noFunds && (
+            <p
+              aria-live="polite"
+              className={`-mt-1 flex items-center gap-1.5 text-xs font-medium ${
+                overdraft ? "text-[var(--wash-rose-ink)]" : "text-[var(--ink-4)]"
+              }`}
+            >
+              {(fundsRow.scope === "personal" ? t.finance.funds.availablePersonal : t.finance.funds.availableCash).replace(
+                "{sum}",
+                fmtAvailable
+              )}
+              {overdraft && (
+                <span>
+                  {" · "}
+                  {(fundsRow.scope === "personal" ? t.finance.funds.exceedsPersonal : t.finance.funds.exceeds).replace(
+                    "{sum}",
+                    fmtAvailable
+                  )}
+                </span>
+              )}
+            </p>
+          )}
+          {noFunds && (
+            <div
+              role="alert"
+              className="flex items-start gap-3 rounded-xl border border-[var(--wash-rose-border)] bg-[var(--wash-rose)] px-4 py-3 text-[var(--wash-rose-ink)]"
+            >
+              <LockIcon className="mt-0.5 h-5 w-5 shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-semibold">{t.finance.funds.lockedTitle} ({currency})</p>
+                <p className="mt-0.5 text-xs leading-snug">
+                  {ownOnly ? t.finance.funds.lockedBodyPersonal : t.finance.funds.lockedBodyCompany}
+                </p>
+                {!ownOnly && (
+                  <button
+                    type="button"
+                    onClick={() => setKind("income")}
+                    className="mt-2 inline-flex items-center gap-1 rounded-md bg-[#18181b] px-2.5 py-1 text-xs font-semibold text-[var(--accent-yellow)] transition-colors hover:bg-[var(--accent-yellow)] hover:text-[#18181b]"
+                  >
+                    <PlusIcon className="h-3.5 w-3.5" />
+                    {t.finance.funds.addIncome}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <label className="flex flex-col gap-1.5">
               <span className={LABEL}>{t.finance.form.counterparty}</span>
@@ -560,14 +657,14 @@ export function EntryModal({
             {!entry && (
               <button
                 type="button"
-                disabled={saving}
+                disabled={saving || blocked}
                 onClick={() => once(() => save(true))()}
                 className="btn btn-secondary btn-md max-sm:w-full"
               >
                 {t.finance.form.saveAndAdd}
               </button>
             )}
-            <button type="submit" disabled={saving} className="btn btn-primary btn-md max-sm:w-full">
+            <button type="submit" disabled={saving || blocked} className="btn btn-primary btn-md max-sm:w-full">
               {t.finance.form.save}
             </button>
           </div>

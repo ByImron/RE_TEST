@@ -7,17 +7,26 @@ import { isSupabaseConfigured } from "@/lib/supabase/isConfigured";
 import { useLocale } from "@/lib/i18n/LocaleProvider";
 import { useAccess } from "@/lib/auth/useRole";
 import { SetupNotice } from "@/components/SetupNotice";
-import { ListToolbar } from "@/components/ActionBar";
-import { PlusIcon, WalletIcon } from "@/components/icons";
+import { Chip, ChipGroup, ListToolbar } from "@/components/ActionBar";
+import { ArrowDownLeftIcon, ArrowUpRightIcon, CheckIcon, LockIcon, MoneyIcon, WalletIcon } from "@/components/icons";
+import { StatCard } from "@/components/StatCard";
 import { HBarChart, type HBarDatum } from "@/components/charts/HBarChart";
 import { CHART_HUES, compactNumber } from "@/components/charts/palette";
 import { CURRENCIES, type Currency } from "@/lib/currency";
 import { localISO, monthStartOffset } from "@/lib/finance/period";
-import { categoryLabel, type CashBalance, type FinanceOverview } from "@/lib/finance/types";
+import { categoryLabel, type CashBalance, type CashflowRow, type FinanceOverview } from "@/lib/finance/types";
+import { buildMoneyMap } from "@/lib/finance/moneyMap";
 import { useFinance } from "@/components/finance/FinanceContext";
 import { ReconcileCard } from "@/components/finance/ReconcileCard";
-import { Money, MonthBars, toneFor } from "@/components/finance/FinanceParts";
-import { FinanceFilter, useCommonFilterState } from "@/components/finance/FinanceToolbarParts";
+import { Money, toneFor } from "@/components/finance/FinanceParts";
+import { CashflowChart } from "@/components/finance/CashflowChart";
+import { MoneyMap } from "@/components/finance/MoneyMap";
+import {
+  AddEntryGroup,
+  FinanceFilter,
+  FinanceTabs,
+  useCommonFilterState,
+} from "@/components/finance/FinanceToolbarParts";
 
 // Expenses are red throughout, the same red as the expense bars and dots --
 // a ranking of categories does not need a colour per row.
@@ -30,12 +39,13 @@ export default function FinanceOverviewPage() {
   const { t } = useLocale();
   const { canViewSales } = useAccess();
   const configured = isSupabaseConfigured();
-  const { range, buildingId, canManage, version, setupMissing, openEntry } = useFinance();
+  const { range, buildingId, version, setupMissing } = useFinance();
   const filters = useCommonFilterState();
 
   const [data, setData] = useState<FinanceOverview | null>(null);
   const [trend, setTrend] = useState<FinanceOverview["by_month"]>([]);
   const [cash, setCash] = useState<CashBalance[]>([]);
+  const [flow, setFlow] = useState<CashflowRow[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
   const [loadedKey, setLoadedKey] = useState<string | null>(null);
 
@@ -95,6 +105,24 @@ export default function FinanceOverviewPage() {
     };
   }, [configured, setupMissing, trendEnd, buildingId, version]);
 
+  // The month-end till for the cash-flow chart: the same twelve months as the
+  // trend above, company-wide. Missing (an older database) just leaves the till
+  // line out -- the income/expense bars come from the trend either way.
+  useEffect(() => {
+    if (!configured || setupMissing) return;
+    let cancelled = false;
+    const from = localISO(monthStartOffset(trendEnd, -(MAX_MONTHS - 1)));
+    createClient()
+      .schema("crm")
+      .rpc("finance_cashflow", { p_from: from, p_to: trendEnd })
+      .then(({ data: result, error }) => {
+        if (!cancelled) setFlow(error ? [] : ((result ?? []) as CashflowRow[]));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [configured, setupMissing, trendEnd, version]);
+
   // The cash balance ignores the period and the building on purpose, so it has
   // its own query: it only changes when something is booked.
   useEffect(() => {
@@ -111,17 +139,26 @@ export default function FinanceOverviewPage() {
     };
   }, [configured, setupMissing, version]);
 
+  // A currency is shown when the period has anything in it OR the till holds some of it:
+  // money sitting in dollars must not vanish from the page because none moved this month.
   const currencies = useMemo(
-    () => CURRENCIES.filter((c) => data?.totals.some((row) => row.currency === c)),
-    [data]
+    () =>
+      CURRENCIES.filter(
+        (c) => data?.totals.some((row) => row.currency === c) || cash.some((row) => row.currency === c)
+      ),
+    [data, cash]
   );
 
   return (
     <div className="flex flex-col gap-5">
       {!configured && <SetupNotice />}
 
-      <ListToolbar filters={filters.chips} onClearAll={filters.reset} clearLabel={t.common.resetFilters}>
+      {/* The same row as every list page: where am I on the left, then the filter and
+          the one yellow "+" on the right. */}
+      <ListToolbar sticky={false} filters={filters.chips} onClearAll={filters.reset} clearLabel={t.common.resetFilters}>
+        <FinanceTabs />
         <FinanceFilter />
+        <AddEntryGroup />
       </ListToolbar>
 
       {failure && (
@@ -133,22 +170,21 @@ export default function FinanceOverviewPage() {
       {loading && !data && <p className="text-[var(--ink-5)]">{t.common.loading}</p>}
 
       {data && currencies.length === 0 && !loading && (
-        <div className={`${CARD} flex flex-col items-center gap-3 px-6 py-12 text-center`}>
-          <p className="text-[var(--ink-4)]">{t.finance.overview.empty}</p>
-          {canManage && (
-            <button type="button" onClick={() => openEntry()} className="btn btn-primary btn-md">
-              <PlusIcon className="h-4 w-4" />
-              {t.finance.addEntry}
-            </button>
-          )}
-        </div>
+        <p className={`${CARD} px-5 py-10 text-center text-sm text-[var(--ink-4)]`}>{t.finance.overview.empty}</p>
       )}
-
-      {data && cash.length > 0 && <BalanceCard cash={cash} />}
 
       {data &&
         currencies.map((currency) => (
-          <CurrencyBlock key={currency} currency={currency} data={data} trend={trend} trendEnd={trendEnd} />
+          <CurrencyBlock
+            key={currency}
+            currency={currency}
+            showHeading={currencies.length > 1}
+            cash={cash.find((row) => row.currency === currency) ?? null}
+            data={data}
+            trend={trend}
+            trendEnd={trendEnd}
+            flow={flow}
+          />
         ))}
 
       {data && data.by_building.length > 0 && (
@@ -161,59 +197,28 @@ export default function FinanceOverviewPage() {
   );
 }
 
-// How much money there actually is, right now, company-wide -- deliberately
-// separate from the three tiles below, which are scoped to the selected
-// period and building. This one never is: it is income minus expense since
-// the very first entry, ignoring both filters, so it answers a different
-// question ("what's in the till today") than "Результат" does ("how did the
-// selected period go").
-function BalanceCard({ cash }: { cash: CashBalance[] }) {
-  const { t } = useLocale();
-  return (
-    <section
-      className={`${CARD} flex flex-col gap-3 p-5 sm:flex-row sm:items-center sm:justify-between sm:gap-6`}
-    >
-      <div className="flex items-start gap-3">
-        <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[color-mix(in_srgb,var(--accent-yellow)_18%,transparent)] text-[var(--accent-yellow)]">
-          <WalletIcon className="h-5 w-5" />
-        </span>
-        <div>
-          <h2 className="text-[15px] font-semibold text-[var(--ink-1)]">{t.finance.balance}</h2>
-          <p className="max-w-sm text-xs text-[var(--ink-5)]">{t.finance.balanceHint}</p>
-        </div>
-      </div>
-      <div className="flex flex-wrap items-center gap-x-6 gap-y-1 sm:pl-1">
-        {cash.map((row) => (
-          <span key={row.currency} className="flex flex-col">
-            <span className={`text-[20px] font-bold leading-tight sm:text-[26px] ${toneFor(row.value)}`}>
-              <Money value={row.value} currency={row.currency} signed />
-            </span>
-            {row.on_hand > 0 && (
-              <span className="text-xs text-[var(--ink-5)]">
-                {t.finance.onHand.replace("{sum}", `${new Intl.NumberFormat("ru-RU").format(row.on_hand)} ${row.currency}`)}
-              </span>
-            )}
-          </span>
-        ))}
-      </div>
-    </section>
-  );
-}
-
 // Everything for one currency: the three headline numbers, the months, and
 // where the expenses went. Currencies never share a block or a scale.
 function CurrencyBlock({
   currency,
+  showHeading,
+  cash,
   data,
   trend,
   trendEnd,
+  flow,
 }: {
   currency: Currency;
+  showHeading: boolean;
+  cash: CashBalance | null;
   data: FinanceOverview;
   trend: FinanceOverview["by_month"];
   trendEnd: string;
+  flow: CashflowRow[];
 }) {
   const { t } = useLocale();
+  const { buildingId } = useFinance();
+  const [mapMode, setMapMode] = useState<"category" | "building">("category");
   const totals = data.totals.find((row) => row.currency === currency) ?? {
     income: 0,
     expense: 0,
@@ -238,6 +243,65 @@ function CurrencyBlock({
     return all.slice(Math.min(firstWithData, MAX_MONTHS - 6));
   }, [trend, trendEnd, currency]);
 
+  // Income and expense come from the trend (they follow the building filter);
+  // the till at the end of each month and the money handed out under report come
+  // from the cash flow, which is company-wide -- so the till line is drawn only
+  // when no single building is selected, and only when every month has it.
+  const chart = useMemo(() => {
+    const byMonth = new Map(flow.filter((r) => r.currency === currency).map((r) => [r.month, r]));
+    const rows = months.map((m) => ({
+      month: m.month,
+      income: m.income,
+      expense: m.expense,
+      advances: byMonth.get(m.month)?.advances ?? 0,
+      cash_end: byMonth.get(m.month)?.cash_end ?? 0,
+    }));
+    const showBalance = buildingId === "all" && months.length > 0 && months.every((m) => byMonth.has(m.month));
+    return { rows, showBalance };
+  }, [flow, months, currency, buildingId]);
+
+  // Where the money of the period came from and where it went. Two readings of
+  // the same totals: by category, or by building.
+  const map = useMemo(() => {
+    const inRows =
+      mapMode === "category"
+        ? data.by_category
+            .filter((c) => c.kind === "income" && c.currency === currency)
+            .map((c) => ({
+              key: c.category_id ?? "none",
+              label: categoryLabel(c.name ? { name: c.name, code: c.code } : null, t.finance.categories.contractPayments, t.finance.noCategory),
+              value: c.total,
+            }))
+        : data.by_building
+            .filter((b) => b.currency === currency)
+            .map((b) => ({
+              key: b.building_id ?? "none",
+              label: b.building_id ? (b.name ?? "—") : t.finance.moneyMap.noBuilding,
+              value: b.income,
+            }));
+    const outRows =
+      mapMode === "category"
+        ? data.by_category
+            .filter((c) => c.kind === "expense" && c.currency === currency)
+            .map((c) => ({
+              key: c.category_id ?? "none",
+              label: categoryLabel(c.name ? { name: c.name, code: c.code } : null, t.finance.categories.contractPayments, t.finance.noCategory),
+              value: c.total,
+            }))
+        : data.by_building
+            .filter((b) => b.currency === currency)
+            .map((b) => ({
+              key: b.building_id ?? "none",
+              label: b.building_id ? (b.name ?? "—") : t.finance.moneyMap.noBuilding,
+              value: b.expense,
+            }));
+    return buildMoneyMap({
+      income: inRows,
+      expense: outRows,
+      labels: { other: t.finance.moneyMap.other, leftover: t.finance.moneyMap.leftover, reserve: t.finance.moneyMap.fromReserve },
+    });
+  }, [data, currency, mapMode, t]);
+
   const expenseBars: HBarDatum[] = data.by_category
     .filter((c) => c.kind === "expense" && c.currency === currency)
     .map((c) => ({
@@ -248,16 +312,59 @@ function CurrencyBlock({
 
   return (
     <section className="flex flex-col gap-4">
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-        <Tile label={t.finance.income} tone="text-[var(--wash-emerald-ink)]" dot="bg-emerald-500">
-          <Money value={totals.income} currency={currency} />
-        </Tile>
-        <Tile label={t.finance.expense} tone="text-[var(--wash-rose-ink)]" dot="bg-rose-500">
-          <Money value={totals.expense} currency={currency} />
-        </Tile>
-        <Tile label={t.finance.result} tone={toneFor(net)} dot="bg-[var(--accent-yellow)]" strong className="col-span-2 sm:col-span-1">
-          <Money value={net} currency={currency} signed />
-        </Tile>
+      {showHeading && (
+        <h2 className="text-[11px] font-semibold uppercase tracking-[0.1em] text-[var(--ink-4)]">{currency}</h2>
+      )}
+
+      {/* The dashboard's own cards, so the numbers read the same here as there. The first
+          is the till today (it ignores the period and the building, which is why it says
+          whether expenses are open); the other three are the chosen period. */}
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        {cash && (
+          <StatCard
+            label={t.finance.balance}
+            tone={cash.value > 0.004 ? "slate" : "rose"}
+            icon={<WalletIcon className="h-4 w-4" />}
+            value={<Money value={cash.value} currency={currency} signed />}
+            sub={
+              <span title={t.finance.balanceHint} className="flex flex-col gap-1">
+                <span
+                  className={`inline-flex w-fit items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                    cash.value > 0.004
+                      ? "bg-[var(--wash-emerald)] text-[var(--wash-emerald-ink)]"
+                      : "bg-[var(--wash-rose)] text-[var(--wash-rose-ink)]"
+                  }`}
+                >
+                  {cash.value > 0.004 ? <CheckIcon className="h-3 w-3" /> : <LockIcon className="h-3 w-3" />}
+                  {cash.value > 0.004 ? t.finance.funds.open : t.finance.funds.closed}
+                </span>
+                {cash.on_hand > 0 && (
+                  <span>
+                    {t.finance.onHand.replace("{sum}", `${new Intl.NumberFormat("ru-RU").format(cash.on_hand)} ${currency}`)}
+                  </span>
+                )}
+              </span>
+            }
+          />
+        )}
+        <StatCard
+          label={t.finance.income}
+          tone="emerald"
+          icon={<ArrowDownLeftIcon className="h-4 w-4" />}
+          value={<Money value={totals.income} currency={currency} />}
+        />
+        <StatCard
+          label={t.finance.expense}
+          tone="rose"
+          icon={<ArrowUpRightIcon className="h-4 w-4" />}
+          value={<Money value={totals.expense} currency={currency} />}
+        />
+        <StatCard
+          label={t.finance.result}
+          tone={net < 0 ? "rose" : net > 0 ? "emerald" : "slate"}
+          icon={<MoneyIcon className="h-4 w-4" />}
+          value={<Money value={net} currency={currency} signed />}
+        />
       </div>
 
       {totals.entries ? (
@@ -266,13 +373,46 @@ function CurrencyBlock({
         </p>
       ) : null}
 
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className={`${CARD} min-w-0 p-5`}>
+        <h2 className="text-[15px] font-semibold text-[var(--ink-1)]">{t.finance.cashflow.title}</h2>
+        <p className="mb-4 mt-0.5 text-xs text-[var(--ink-5)]">{t.finance.cashflow.hint}</p>
+        {chart.rows.length > 0 ? (
+          <CashflowChart data={chart.rows} currency={currency} showBalance={chart.showBalance} />
+        ) : (
+          <p className="text-sm text-[var(--ink-5)]">{t.finance.cashflow.empty}</p>
+        )}
+        {chart.rows.length > 0 && !chart.showBalance && buildingId !== "all" && (
+          <p className="mt-2 text-xs text-[var(--ink-5)]">{t.finance.cashflow.companyNote}</p>
+        )}
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
         <div className={`${CARD} min-w-0 p-5`}>
-          <h2 className="mb-4 text-[15px] font-semibold text-[var(--ink-1)]">{t.finance.overview.monthly}</h2>
-          {months.length > 0 ? (
-            <MonthBars data={months} currency={currency} />
+          <div className="mb-3 flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+            <div>
+              <h2 className="text-[15px] font-semibold text-[var(--ink-1)]">{t.finance.moneyMap.title}</h2>
+              <p className="mt-0.5 max-w-md text-xs text-[var(--ink-5)]">{t.finance.moneyMap.hint}</p>
+            </div>
+            <ChipGroup>
+              <Chip label={t.finance.moneyMap.byCategory} active={mapMode === "category"} onClick={() => setMapMode("category")} />
+              <Chip label={t.finance.moneyMap.byBuilding} active={mapMode === "building"} onClick={() => setMapMode("building")} />
+            </ChipGroup>
+          </div>
+          {map.total > 0 ? (
+            <MoneyMap
+              sources={map.sources}
+              uses={map.uses}
+              total={map.total}
+              currency={currency}
+              totalLabel={t.finance.moneyMap.total.replace("{sum}", `${new Intl.NumberFormat("ru-RU").format(Math.round(map.total * 100) / 100)} ${currency}`)}
+              ariaLabel={t.finance.moneyMap.aria
+                .replace("{in}", `${new Intl.NumberFormat("ru-RU").format(map.incomeTotal)} ${currency}`)
+                .replace("{out}", `${new Intl.NumberFormat("ru-RU").format(map.expenseTotal)} ${currency}`)}
+              moneyIn={t.finance.moneyMap.moneyIn}
+              moneyOut={t.finance.moneyMap.moneyOut}
+            />
           ) : (
-            <p className="text-sm text-[var(--ink-5)]">{t.finance.overview.empty}</p>
+            <p className="text-sm text-[var(--ink-5)]">{t.finance.moneyMap.empty}</p>
           )}
         </div>
         <div className={`${CARD} min-w-0 p-5`}>
@@ -285,36 +425,6 @@ function CurrencyBlock({
         </div>
       </div>
     </section>
-  );
-}
-
-function Tile({
-  label,
-  tone,
-  dot,
-  strong = false,
-  className = "",
-  children,
-}: {
-  label: string;
-  tone: string;
-  dot: string;
-  strong?: boolean;
-  className?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div
-      className={`${CARD} animate-fade-up p-4 ${
-        strong ? "ring-1 ring-[color-mix(in_srgb,var(--accent-yellow)_55%,transparent)]" : ""
-      } ${className}`}
-    >
-      <p className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-[var(--ink-4)]">
-        <span aria-hidden="true" className={`h-2 w-2 rounded-full ${dot}`} />
-        {label}
-      </p>
-      <div className={`mt-1.5 text-[22px] font-bold leading-tight sm:text-[28px] ${tone}`}>{children}</div>
-    </div>
   );
 }
 

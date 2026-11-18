@@ -66,7 +66,15 @@ export type FinanceOverview = {
 export type CashBalance = { currency: Currency; value: number; on_hand: number };
 
 // One person's money under report: issued minus spent, per currency.
-export type PersonBalance = { currency: Currency; issued: number; spent: number; balance: number };
+// given/returned arrive with block 080 (issued is the NET of the two): an older database leaves them out.
+export type PersonBalance = {
+  currency: Currency;
+  issued: number;
+  spent: number;
+  balance: number;
+  given?: number;
+  returned?: number;
+};
 export type AdvancePerson = { id: string; email: string; balances: PersonBalance[] };
 
 // One row of a person's merged ledger (crm.finance_person_ledger): their
@@ -111,3 +119,27 @@ export function categoryLabel(
     ? contractPaymentsLabel
     : category.name;
 }
+
+// What crm.finance_available() returns, per currency: how much can still be
+// spent by THIS person, and from which pot -- their own money under report
+// ("personal": a buyer) or the company till ("company": accountant, admin).
+// `cash` is the till itself, filled only for those who may issue money under
+// report. A balance at or below zero closes the "add expense" door; the
+// database refuses such a row whatever the screen does (block 078).
+export type FundsRow = {
+  currency: Currency;
+  scope: "company" | "personal";
+  available: number;
+  cash: number | null;
+};
+
+// One month of crm.finance_cashflow(): what came in, what went out, what was
+// handed out under report (net of returns), and the till at the end of it.
+export type CashflowRow = {
+  month: string;
+  currency: Currency;
+  income: number;
+  expense: number;
+  advances: number;
+  cash_end: number;
+};

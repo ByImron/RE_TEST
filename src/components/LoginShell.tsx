@@ -212,7 +212,14 @@ export function LoginShell({ children }: { children: ReactNode }) {
 
           <p className="text-xs tracking-wide text-slate-500">
             developed by{" "}
-            <span className="font-semibold text-slate-700">IMRON</span>
+            <a
+              href="https://www.instagram.com/iammirzozoda"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="-mx-1.5 rounded px-1.5 font-semibold text-slate-700 transition-colors hover:bg-slate-100 hover:text-slate-900"
+            >
+              IMRON
+            </a>
           </p>
         </div>
       </section>

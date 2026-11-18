@@ -197,6 +197,34 @@ export function PillButton({
   );
 }
 
+// The same pill, for options that are pages (a section's tabs): a link, marked as the
+// current page, looking exactly like the pills beside it.
+export function PillLink({
+  label,
+  href,
+  active = false,
+  size,
+}: {
+  label: ReactNode;
+  href: string;
+  active?: boolean;
+  size?: ToolbarSize;
+}) {
+  const inherited = useContext(SizeContext);
+  const s = size ?? inherited;
+  return (
+    <Link
+      href={href}
+      aria-current={active ? "page" : undefined}
+      className={`inline-flex shrink-0 items-center whitespace-nowrap rounded-md font-medium transition-colors duration-150 active:scale-[0.97] ${FOCUS_RING} ${
+        s === "sm" ? "h-7 px-2 text-xs" : "h-8 px-3 text-[13px]"
+      } ${active ? ON_LOOK : `text-[var(--ink-3)] ${HOVER_YELLOW}`}`}
+    >
+      {label}
+    </Link>
+  );
+}
+
 // One icon-only action with its name on hover.
 //
 // The label is not decoration: an icon on its own is a guess until you click
@@ -407,9 +435,12 @@ export function FilterMenu({
     };
   }, [open]);
 
-  // A `summary` ("Этот месяц") keeps the button open even with nothing
-  // narrowed: it says what the list is showing, not only that a filter is on.
-  const on = activeCount > 0 || !!summary;
+  // A `summary` ("Этот месяц") keeps the TEXT showing even with nothing narrowed: it says
+  // what the list is showing, not only that a filter is on. The dark "on" look is kept for
+  // a filter that really narrows something (or an open panel), so at rest the button is
+  // the same quiet funnel as on every other page.
+  const on = activeCount > 0;
+  const showText = on || !!summary;
   const shown = summary || label;
 
   return (
@@ -437,7 +468,7 @@ export function FilterMenu({
         </span>
         <span
           className={`overflow-hidden whitespace-nowrap text-[13px] font-medium text-[var(--ink-2)] transition-[max-width,opacity,padding] duration-200 ease-out ${
-            on
+            showText
               ? "max-w-[12rem] pl-1.5 pr-2 opacity-100"
               : "max-w-0 pl-0 pr-0 opacity-0 group-hover/filter:max-w-[12rem] group-hover/filter:pl-1.5 group-hover/filter:pr-2 group-hover/filter:opacity-100"
           }`}
@@ -591,14 +622,27 @@ export function ListToolbar({
   filters = [],
   onClearAll,
   clearLabel,
+  sticky = true,
 }: {
   children: ReactNode;
   filters?: ActiveFilter[];
   onClearAll?: () => void;
   clearLabel?: string;
+  /**
+   * Stays at the top while the list scrolls (the default: a long list with a search box
+   * wants it). Pages whose toolbar is just a period or building picker turn it off -- a
+   * strip that follows you down the page, covering the cards under it, helps nobody.
+   */
+  sticky?: boolean;
 }) {
   return (
-    <div className="sticky top-0 z-20 -mx-4 flex flex-col gap-2 bg-[var(--surface-0)] px-4 py-2 sm:-mx-5 sm:px-5">
+    <div
+      className={
+        sticky
+          ? "sticky top-0 z-20 -mx-4 flex flex-col gap-2 bg-[var(--surface-0)] px-4 py-2 sm:-mx-5 sm:px-5"
+          : "flex flex-col gap-2 py-1"
+      }
+    >
       <div className="flex flex-wrap items-center justify-end gap-2">{children}</div>
       <ActiveFilters items={filters} onClearAll={onClearAll} clearLabel={clearLabel} />
     </div>

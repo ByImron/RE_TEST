@@ -1,22 +1,89 @@
 "use client";
 
 import type { ReactNode } from "react";
+import { usePathname } from "next/navigation";
 import { useLocale } from "@/lib/i18n/LocaleProvider";
 import {
   Chip,
   ChipGroup,
+  ControlGroup,
   FILTER_DATE,
   FILTER_SELECT,
   FilterMenu,
   FilterSection,
+  GroupDivider,
+  IconAction,
+  PillLink,
   type ActiveFilter,
 } from "@/components/ActionBar";
+import { PlusIcon } from "@/components/icons";
 import { MIN_BUSINESS_DATE, yearsAheadISO } from "@/lib/dates";
 import { formatShortDate } from "@/lib/formatDate";
 import type { PeriodPreset } from "@/lib/finance/period";
 import { useFinance } from "@/components/finance/FinanceContext";
 
 const PRESETS: Exclude<PeriodPreset, "custom">[] = ["month", "prevMonth", "quarter", "year", "all"];
+
+// The three parts of the section as pills in the same bordered box every other
+// toolbar uses -- the leftmost thing on the toolbar row, so the row reads
+// "where am I | narrow it down | do something", the same as on every list page.
+export function FinanceTabs() {
+  const { t } = useLocale();
+  const pathname = usePathname();
+  const tabs = [
+    { href: "/finance", label: t.finance.tabs.overview },
+    { href: "/finance/transactions", label: t.finance.tabs.entries },
+    { href: "/finance/advances", label: t.finance.tabs.advances },
+  ];
+  return (
+    <nav aria-label={t.finance.title} className="mr-auto min-w-0 max-sm:w-full">
+      <ControlGroup scrollable>
+        {tabs.map((tab) => (
+          <PillLink
+            key={tab.href}
+            href={tab.href}
+            label={tab.label}
+            active={tab.href === "/finance" ? pathname === "/finance" : pathname.startsWith(tab.href)}
+          />
+        ))}
+      </ControlGroup>
+    </nav>
+  );
+}
+
+// "Add an operation": the one yellow "+" of the page, like "add client" on the
+// clients page, reachable with N. Tablet and up only -- on a phone the round
+// button at the bottom of the screen is the one way in (never both). To glue it
+// to neighbours inside their group pass `divider`; on its own use <AddEntryGroup/>.
+export function AddEntryAction({ divider = false }: { divider?: boolean }) {
+  const { t } = useLocale();
+  const { canManage, setupMissing, openEntry } = useFinance();
+  if (!canManage || setupMissing) return null;
+  return (
+    <span className="hidden sm:contents">
+      {divider && <GroupDivider />}
+      <IconAction
+        label={t.finance.addEntry}
+        icon={<PlusIcon />}
+        tone="primary"
+        shortcut="N"
+        onClick={() => openEntry()}
+      />
+    </span>
+  );
+}
+
+export function AddEntryGroup() {
+  const { canManage, setupMissing } = useFinance();
+  if (!canManage || setupMissing) return null;
+  return (
+    <span className="hidden sm:inline-flex">
+      <ControlGroup>
+        <AddEntryAction />
+      </ControlGroup>
+    </span>
+  );
+}
 
 // Applied filters as removable chips (the period is not one of them -- it is
 // written on the filter button itself), plus how many differ from the default.

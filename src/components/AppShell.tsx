@@ -8,6 +8,7 @@ import { createClient } from "@/lib/supabase/client";
 import { useSettings } from "@/lib/settings/SettingsProvider";
 import { useAuth } from "@/lib/auth/useRole";
 import { canView, isOwnOnly } from "@/lib/auth/access";
+import { useScrollMemory } from "@/lib/useScrollMemory";
 import { OfflineBanner } from "@/components/OfflineBanner";
 import { QuickSearch } from "@/components/QuickSearch";
 import { InstallPrompt } from "@/components/InstallPrompt";
@@ -111,6 +112,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       ?.querySelector<HTMLElement>('[aria-current="page"]')
       ?.scrollIntoView({ inline: "center", block: "nearest" });
   }, [pathname, visibleNavItems.length]);
+  // <main> is what scrolls; "back" gives it its position back (see useScrollMemory).
+  const mainRef = useScrollMemory();
   const brandName = settings.company_name || t.appName;
   // One destination (a person who only has Finance) needs no tab bar: it would
   // be a single tab, and it would eat the bottom of a phone screen.
@@ -314,6 +317,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </header>
 
         <main
+          ref={mainRef}
           className={`flex-1 overflow-y-auto overflow-x-hidden bg-[var(--surface-0)] p-4 sm:p-5 sm:pb-5 print:overflow-visible print:bg-white print:p-0 ${
             showBottomNav ? "pb-24" : "pb-6"
           }`}

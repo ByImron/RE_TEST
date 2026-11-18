@@ -144,26 +144,68 @@ const esc = (v: Cell) =>
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 
-export function exportPdf(title: string, headers: string[], rows: Cell[][]) {
-  const thead = `<tr>${headers.map((h) => `<th>${esc(h)}</th>`).join("")}</tr>`;
+// What the printed sheet can add to the plain table. Everything is optional, so the
+// exports that never asked for any of it print exactly as before.
+export type PdfOptions = {
+  /** Empty columns at the right, to write in by hand (e.g. "result of the call"). */
+  extraColumns?: string[];
+  /** A line under the title. */
+  subtitle?: string;
+  /** A line under the table (totals). */
+  footer?: string;
+  /** Columns (0-based) that must stay on one line -- a phone number, a date. */
+  nowrapColumns?: number[];
+  /** Columns (0-based) printed in bold -- what the reader looks for first. */
+  strongColumns?: number[];
+};
+
+const pdfNumber = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
+
+export function exportPdf(title: string, headers: string[], rows: Cell[][], options: PdfOptions = {}) {
+  const extra = options.extraColumns ?? [];
+  const thead = `<tr>${headers.map((h) => `<th>${esc(h)}</th>`).join("")}${extra
+    .map((h) => `<th class="note">${esc(h)}</th>`)
+    .join("")}</tr>`;
+  // A real number is printed grouped and right-aligned; text as it is.
+  const cell = (c: Cell, i: number) => {
+    const classes = [
+      isNumeric(c) ? "num" : "",
+      options.nowrapColumns?.includes(i) ? "nw" : "",
+      options.strongColumns?.includes(i) ? "strong" : "",
+    ].filter(Boolean);
+    const cls = classes.length ? ` class="${classes.join(" ")}"` : "";
+    return `<td${cls}>${esc(isNumeric(c) ? pdfNumber.format(c) : c)}</td>`;
+  };
   const tbody = rows
-    .map((r) => `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`)
+    .map((r) => `<tr>${r.map(cell).join("")}${extra.map(() => '<td class="note"></td>').join("")}</tr>`)
     .join("");
   const doc = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(
     title
   )}</title><style>
     * { font-family: Arial, sans-serif; }
-    h2 { color:#1c1a3a; margin:0 0 12px; }
-    .date { color:#64748b; font-size:12px; margin:0 0 16px; }
+    h2 { color:#1c1a3a; margin:0 0 6px; }
+    .sub { color:#334155; font-size:13px; margin:0 0 4px; }
+    .date { color:#64748b; font-size:12px; margin:0 0 14px; }
     table { border-collapse: collapse; width: 100%; font-size: 12px; }
-    th { background:#1c1a3a; color:#fff; text-align:left; padding:6px 8px; }
-    td { border-bottom:1px solid #e2e8f0; padding:5px 8px; }
-    tr:nth-child(even) td { background:#f8fafc; }
-    @page { size: A4 landscape; margin: 12mm; }
+    /* A long list runs over several pages: the header is repeated on each one and a
+       row is never cut in half between two of them. */
+    thead { display: table-header-group; }
+    tr { page-break-inside: avoid; }
+    th { background:#1c1a3a; color:#fff; text-align:left; padding:6px 8px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    td { border-bottom:1px solid #cbd5e1; padding:6px 8px; vertical-align: top; }
+    td.num { text-align:right; white-space:nowrap; }
+    td.nw { white-space:nowrap; }
+    td.strong { font-weight:bold; }
+    th.note, td.note { min-width: 42mm; border-left:1px dashed #94a3b8; }
+    tr:nth-child(even) td { background:#f8fafc; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .footer { margin-top:12px; font-size:13px; font-weight:bold; color:#1c1a3a; }
+    @page { size: A4 landscape; margin: 10mm; }
   </style></head><body>
     <h2>${esc(title)}</h2>
+    ${options.subtitle ? `<p class="sub">${esc(options.subtitle)}</p>` : ""}
     <p class="date">${new Date().toLocaleDateString()}</p>
     <table><thead>${thead}</thead><tbody>${tbody}</tbody></table>
+    ${options.footer ? `<p class="footer">${esc(options.footer)}</p>` : ""}
     <script>window.onload=function(){setTimeout(function(){window.print();},300);};</script>
   </body></html>`;
   const w = window.open("", "_blank");

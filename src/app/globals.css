@@ -1107,3 +1107,41 @@ summary,
     font-size: max(16px, 1em);
   }
 }
+
+/* ---- The round "add" button on a phone ----
+   One yellow circle with a plus, ringed by two soft waves that spread and fade
+   -- it says "press me" without being a big static slab. The rings are separate
+   elements, so the button itself never moves under the thumb. With reduced
+   motion the waves are replaced by a still halo. */
+.fab-halo {
+  box-shadow:
+    0 0 0 6px color-mix(in srgb, var(--accent-yellow) 28%, transparent),
+    0 10px 24px -6px rgb(0 0 0 / 0.35);
+}
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes fab-wave {
+    0% {
+      transform: scale(1);
+      opacity: 0.55;
+    }
+    75%,
+    100% {
+      /* 1.5, not more: the circle sits 16px from the screen edge and the wave must
+         stay inside that margin -- a wave that spills over the edge widens the page
+         and a phone then scrolls (or zooms out) sideways. */
+      transform: scale(1.5);
+      opacity: 0;
+    }
+  }
+  .fab-wave {
+    animation: fab-wave 2.4s cubic-bezier(0.2, 0.6, 0.3, 1) infinite;
+  }
+  .fab-wave-late {
+    animation-delay: 1.2s;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fab-wave {
+    display: none;
+  }
+}
