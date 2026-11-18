@@ -2075,6 +2075,10 @@ grant execute on function crm.set_user_role(uuid, text) to authenticated;
 -- ПОСЛЕ ПЕРВОГО ВХОДА ОБЯЗАТЕЛЬНО СМЕНИТЕ ПАРОЛЬ в программе:
 -- Настройки → «Сменить пароль».
 --
+-- Заодно, если в базе уже есть аккаунт iammirzozoda@gmail.com,
+-- который не пускал, — этот файл чинит его: подтверждает почту и
+-- делает админом.
+--
 -- Файл идемпотентный — можно запускать повторно. ВАЖНО (блок 057):
 -- пароль задаётся только при первом создании аккаунта. Если аккаунт уже
 -- есть, повторный запуск больше НЕ переписывает его пароль обратно на
@@ -2177,6 +2181,9 @@ revoke all on function crm.ensure_admin(text, text) from authenticated;
 
 -- Готовый вход "из коробки".
 select crm.ensure_admin('admin@crm.tj', 'Admin12345');
+
+-- Чиним/поднимаем ваш личный аккаунт, если он был заведён раньше.
+select crm.ensure_admin('iammirzozoda@gmail.com', 'Admin12345');
 
 -- ############################################################
 -- ### 030_sales_by_manager.sql
@@ -8295,7 +8302,10 @@ $$;
 grant execute on function crm.contract_baseline_plan(uuid) to authenticated;
 
 -- ---------- договоры, у которых график уехал вперёд ----------
-create or replace function crm.schedule_shifts()
+-- (блок 083 меняет состав колонок этой функции, а create or replace этого не умеет --
+-- поэтому перед каждым созданием она удаляется, иначе повторный запуск файла падал бы)
+drop function if exists crm.schedule_shifts();
+create function crm.schedule_shifts()
 returns table (
   contract_id uuid,
   contract_number text,
@@ -8577,3 +8587,1496 @@ end;
 $$;
 
 grant execute on function crm.regenerate_schedule(uuid, integer) to authenticated;
+
+-- ### 078_finance_spend_guard.sql
+
+-- ============================================================
+-- 078: ФИНАНСЫ -- расход и выдача под отчёт не уходят «в минус»; движение денег.
+--
+-- ЗАЧЕМ. До сих пор расход можно было записать при любом балансе: касса
+-- или остаток у подотчётного тихо уходили в минус, и отчёт показывал деньги,
+-- которых нет. Теперь база сама не принимает такую запись -- ни у бухгалтера
+-- и админа, ни у снабженца, с любого устройства и любым способом ввода.
+--
+-- КАКОЙ БАЛАНС ПРОВЕРЯЕТСЯ (по каждой валюте отдельно, сомони и доллары не
+-- смешиваются):
+--   * расход вводит снабженец (или вообще тот, кому что-то выдавали под
+--     отчёт) -- смотрим его личный баланс: выдано - потрачено (то же, что в
+--     crm.finance_my_balance). Деньги из кассы уже ушли при выдаче;
+--   * расход вводит бухгалтер/админ -- смотрим кассу компании (то же число,
+--     что crm.finance_cash: приход - расход - деньги на руках у подотчётных);
+--   * выдача под отчёт (+) -- не больше кассы; возврат (-) -- не больше того,
+--     что сейчас на руках у человека.
+-- Запись больше баланса отклоняется с понятным текстом; запись на всю сумму
+-- баланса проходит (остаётся ровно ноль). Правка суммы вверх проверяется на
+-- РАЗНИЦУ; правка вниз, смена даты, названия, заметки, удаление -- никогда не
+-- блокируются (деньги должно быть можно исправить). Приход не проверяется
+-- вообще -- именно приход выводит кассу из нуля.
+--
+-- Проверка стоит только для сеансов пользователей (auth.uid() не пусто):
+-- служебные задания и SQL-редактор (загрузка/исправление данных) мимо неё.
+-- Параллельные записи одного баланса идут по очереди (advisory-замок), поэтому
+-- два одновременных расхода не пройдут оба «на последние деньги».
+--
+-- ЧТО ДОБАВЛЯЕТ БЛОК:
+--   * crm.finance_cash_value(валюта), crm.finance_person_balance(человек,
+--     валюта), crm.finance_is_holder(человек, валюта) -- те же формулы, что у
+--     crm.finance_cash / crm.finance_my_balance, но для проверки в триггерах;
+--   * триггеры finance_entries_zz_guard и finance_advances_zz_guard (имена с
+--     «zz», чтобы сработать ПОСЛЕ расчёта итога и проставления автора);
+--   * crm.finance_available() -- «сколько можно потратить» для экранов
+--     (по каждой валюте и по тому балансу, который проверяется);
+--   * crm.finance_cashflow(от, до) -- движение денег по месяцам: приход,
+--     расход, выдано под отчёт и остаток кассы на конец месяца (график
+--     «Денежный поток»).
+--
+-- Идемпотентно. Существующие записи НЕ трогаются: если баланс уже в минусе,
+-- новые расходы просто не принимаются, пока не поступит приход.
+-- ============================================================
+
+-- ---------- те же формулы, что в crm.finance_cash / crm.finance_my_balance ----------
+-- VOLATILE on purpose (no "stable"): a multi-row INSERT fires this for row 2
+-- after row 1 is already in the table, and only a volatile function sees it. The
+-- sum is taken over the entries themselves, not the monthly summary, because that
+-- summary is updated after the whole statement -- a batch of expenses sent in one
+-- request could otherwise each pass "on the last money" together.
+create or replace function crm.finance_cash_value(p_currency crm.currency)
+returns numeric
+language sql
+volatile
+security definer
+set search_path = crm, public
+as $$
+  select
+    coalesce((
+      select coalesce(sum(e.amount) filter (where e.kind = 'income'), 0)
+           - coalesce(sum(e.amount) filter (where e.kind = 'expense'), 0)
+      from crm.finance_entries e where e.currency = p_currency
+    ), 0)
+    - coalesce((
+      select sum(greatest(h.issued - coalesce(s.spent, 0), 0))
+      from (
+        select a.person_id, sum(a.amount) as issued
+        from crm.finance_advances a where a.currency = p_currency group by a.person_id
+      ) h
+      left join (
+        select e.created_by as person_id, sum(e.amount) as spent
+        from crm.finance_entries e
+        where e.kind = 'expense' and e.contract_payment_id is null and e.currency = p_currency
+          and e.created_by in (select a2.person_id from crm.finance_advances a2 where a2.currency = p_currency)
+        group by e.created_by
+      ) s on s.person_id = h.person_id
+    ), 0);
+$$;
+
+create or replace function crm.finance_person_balance(p_person uuid, p_currency crm.currency)
+returns numeric
+language sql
+volatile
+security definer
+set search_path = crm, public
+as $$
+  select
+    coalesce((select sum(a.amount) from crm.finance_advances a
+              where a.person_id = p_person and a.currency = p_currency), 0)
+    - coalesce((select sum(e.amount) from crm.finance_entries e
+                where e.created_by = p_person and e.kind = 'expense'
+                  and e.contract_payment_id is null and e.currency = p_currency), 0);
+$$;
+
+-- Тратит ли человек свои деньги «на руках» (а не кассу компании): ему открыт
+-- уровень «только свои расходы» (кроме админа) либо ему выдавали деньги под
+-- отчёт в этой валюте.
+create or replace function crm.finance_is_holder(p_person uuid, p_currency crm.currency)
+returns boolean
+language sql
+volatile
+security definer
+set search_path = crm, public
+as $$
+  select exists (
+           select 1 from crm.finance_advances a
+           where a.person_id = p_person and a.currency = p_currency
+         )
+      or coalesce((
+           select pr.role <> 'admin'
+              and coalesce(pr.finance_level, case when pr.role = 'procurement' then 'own' end) = 'own'
+           from crm.profiles pr where pr.id = p_person
+         ), false);
+$$;
+
+-- ---------- замок на расходе ----------
+create or replace function crm.finance_entries_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = crm, public
+as $$
+declare
+  v_need numeric;
+  v_have numeric;
+  v_personal boolean;
+begin
+  if auth.uid() is null then
+    return new;                              -- служебные задания, SQL-редактор
+  end if;
+  if new.kind <> 'expense' or new.contract_payment_id is not null then
+    return new;                              -- приход выводит кассу из нуля
+  end if;
+
+  -- Правка вверх проверяется на разницу; во всех остальных случаях (новая
+  -- запись, смена валюты или вида) -- на всю сумму.
+  if tg_op = 'UPDATE' and old.kind = 'expense' and old.currency = new.currency
+     and old.created_by is not distinct from new.created_by then
+    v_need := new.amount - old.amount;
+  else
+    v_need := new.amount;
+  end if;
+  if v_need <= 0.005 then
+    return new;
+  end if;
+
+  v_personal := crm.finance_is_holder(new.created_by, new.currency);
+  if v_personal then
+    perform pg_advisory_xact_lock(hashtextextended('finance:person:' || new.created_by::text || ':' || new.currency::text, 0));
+    v_have := crm.finance_person_balance(new.created_by, new.currency);
+  else
+    perform pg_advisory_xact_lock(hashtextextended('finance:company:' || new.currency::text, 0));
+    v_have := crm.finance_cash_value(new.currency);
+  end if;
+
+  if v_need > v_have + 0.005 then
+    raise exception using
+      errcode = 'P0001',
+      message = case when v_personal
+        then format('Недостаточно денег на руках: доступно %s %s, расход %s %s',
+                    round(greatest(v_have, 0), 2), new.currency, round(v_need, 2), new.currency)
+        else format('Недостаточно денег в кассе: доступно %s %s, расход %s %s',
+                    round(greatest(v_have, 0), 2), new.currency, round(v_need, 2), new.currency)
+      end,
+      hint = 'no_funds',
+      detail = jsonb_build_object(
+        'op', 'expense',
+        'scope', case when v_personal then 'personal' else 'company' end,
+        'currency', new.currency,
+        'available', round(greatest(v_have, 0), 2),
+        'requested', round(v_need, 2)
+      )::text;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists finance_entries_zz_guard on crm.finance_entries;
+create trigger finance_entries_zz_guard
+  before insert or update on crm.finance_entries
+  for each row execute function crm.finance_entries_guard();
+
+-- ---------- замок на выдаче и возврате под отчёт ----------
+create or replace function crm.finance_advances_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = crm, public
+as $$
+declare
+  v_need numeric;
+  v_have numeric;
+  v_give boolean := new.amount > 0;
+begin
+  if auth.uid() is null then
+    return new;
+  end if;
+
+  if tg_op = 'UPDATE' and old.currency = new.currency and old.person_id = new.person_id
+     and sign(old.amount) = sign(new.amount) then
+    v_need := abs(new.amount) - abs(old.amount);
+  else
+    v_need := abs(new.amount);
+  end if;
+  if v_need <= 0.005 then
+    return new;
+  end if;
+
+  if v_give then
+    perform pg_advisory_xact_lock(hashtextextended('finance:company:' || new.currency::text, 0));
+    v_have := crm.finance_cash_value(new.currency);
+  else
+    perform pg_advisory_xact_lock(hashtextextended('finance:person:' || new.person_id::text || ':' || new.currency::text, 0));
+    v_have := crm.finance_person_balance(new.person_id, new.currency);
+  end if;
+
+  if v_need > v_have + 0.005 then
+    raise exception using
+      errcode = 'P0001',
+      message = case when v_give
+        then format('Недостаточно денег в кассе для выдачи: доступно %s %s, выдача %s %s',
+                    round(greatest(v_have, 0), 2), new.currency, round(v_need, 2), new.currency)
+        else format('Нельзя вернуть больше, чем на руках: у человека %s %s, возврат %s %s',
+                    round(greatest(v_have, 0), 2), new.currency, round(v_need, 2), new.currency)
+      end,
+      hint = 'no_funds',
+      detail = jsonb_build_object(
+        'op', case when v_give then 'give' else 'return' end,
+        'scope', case when v_give then 'company' else 'personal' end,
+        'currency', new.currency,
+        'available', round(greatest(v_have, 0), 2),
+        'requested', round(v_need, 2)
+      )::text;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists finance_advances_zz_guard on crm.finance_advances;
+create trigger finance_advances_zz_guard
+  before insert or update on crm.finance_advances
+  for each row execute function crm.finance_advances_guard();
+
+-- ---------- «сколько можно потратить» для экранов ----------
+-- По каждой валюте -- тот баланс, который проверит замок: у снабженца свой
+-- (scope = personal), у бухгалтера и админа касса (scope = company). Остальным
+-- (директор и т.д.) -- пусто: вводить им нечего.
+create or replace function crm.finance_available()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = crm, public
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_out jsonb := '[]'::jsonb;
+  c crm.currency;
+  v_personal boolean;
+begin
+  if v_uid is null or not (crm.can_manage_finance() or crm.is_finance_own()) then
+    return '[]'::jsonb;
+  end if;
+  foreach c in array enum_range(null::crm.currency) loop
+    v_personal := crm.finance_is_holder(v_uid, c);
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'currency', c,
+      'scope', case when v_personal then 'personal' else 'company' end,
+      'available', case when v_personal then crm.finance_person_balance(v_uid, c)
+                        else crm.finance_cash_value(c) end,
+      -- the till itself, for issuing money under report (only those who manage finance)
+      'cash', case when crm.can_manage_finance() then crm.finance_cash_value(c) end
+    ));
+  end loop;
+  return v_out;
+end;
+$$;
+
+grant execute on function crm.finance_available() to authenticated;
+
+-- ---------- движение денег по месяцам ----------
+-- Приход и расход берутся из сводки по месяцам (быстро, без сырых строк);
+-- «выдано под отчёт» -- чистая выдача за месяц (выдачи минус возвраты);
+-- остаток кассы на конец месяца считается тем же правилом, что crm.finance_cash:
+-- накопленный (приход - расход) минус деньги на руках у подотчётных на ту дату.
+-- Касса общая на компанию, поэтому здесь нет фильтра по зданию. security
+-- invoker: замок -- RLS (видят только те, кто видит финансы целиком).
+create or replace function crm.finance_cashflow(p_from date, p_to date)
+returns jsonb
+language sql
+stable
+security invoker
+set search_path = crm, public
+as $$
+-- Every piece the later steps look up repeatedly is MATERIALIZED: left to be inlined,
+-- the spending-by-person scan of the entries ran again for every month x person and
+-- the report took 17 s on a year of data instead of a fraction of a second.
+with
+months as materialized (
+  select g::date as month
+  from generate_series(date_trunc('month', p_from)::date, date_trunc('month', p_to)::date, interval '1 month') g
+),
+cur as materialized (
+  select unnest(enum_range(null::crm.currency)) as currency
+),
+grid as materialized (
+  select mo.month, c.currency from months mo cross join cur c
+),
+flow as materialized (
+  select m.month, m.currency,
+         coalesce(sum(m.total) filter (where m.kind = 'income'), 0) as income,
+         coalesce(sum(m.total) filter (where m.kind = 'expense'), 0) as expense
+  from crm.finance_monthly m
+  group by m.month, m.currency
+),
+adv as materialized (
+  select a.person_id, date_trunc('month', a.given_on)::date as month, a.currency, sum(a.amount) as amt
+  from crm.finance_advances a
+  group by 1, 2, 3
+),
+people as materialized (
+  select distinct person_id from crm.finance_advances
+),
+spent as materialized (
+  select e.created_by as person_id, date_trunc('month', e.occurred_on)::date as month,
+         e.currency, sum(e.amount) as amt
+  from crm.finance_entries e
+  where e.kind = 'expense' and e.contract_payment_id is null
+    and e.created_by in (select person_id from people)
+  group by 1, 2, 3
+),
+net as materialized (
+  select g.month, g.currency,
+         coalesce((select sum(f2.income - f2.expense) from flow f2
+                   where f2.currency = g.currency and f2.month <= g.month), 0) as net
+  from grid g
+),
+held as materialized (
+  select g.month, g.currency,
+         coalesce(sum(greatest(b.bal, 0)), 0) as on_hand
+  from grid g
+  left join lateral (
+    select p.person_id,
+           coalesce((select sum(a2.amt) from adv a2
+                     where a2.person_id = p.person_id and a2.currency = g.currency and a2.month <= g.month), 0)
+         - coalesce((select sum(s2.amt) from spent s2
+                     where s2.person_id = p.person_id and s2.currency = g.currency and s2.month <= g.month), 0) as bal
+    from people p
+  ) b on true
+  group by g.month, g.currency
+),
+series as (
+  select g.month, g.currency,
+         coalesce(f.income, 0) as income,
+         coalesce(f.expense, 0) as expense,
+         coalesce((select sum(a3.amt) from adv a3 where a3.month = g.month and a3.currency = g.currency), 0) as advances,
+         n.net - h.on_hand as cash_end
+  from grid g
+  left join flow f on f.month = g.month and f.currency = g.currency
+  join net n on n.month = g.month and n.currency = g.currency
+  join held h on h.month = g.month and h.currency = g.currency
+)
+select coalesce(jsonb_agg(jsonb_build_object(
+  'month', to_char(month, 'YYYY-MM'),
+  'currency', currency,
+  'income', income,
+  'expense', expense,
+  'advances', advances,
+  'cash_end', cash_end
+) order by month, currency), '[]'::jsonb)
+from series;
+$$;
+
+grant execute on function crm.finance_cashflow(date, date) to authenticated;
+
+-- ---------- служебные функции замка не вызываются снаружи ----------
+-- Postgres по умолчанию даёт EXECUTE всем (PUBLIC), а через PostgREST любая
+-- такая функция становится вызываемой по ключу anon: без этого REVOKE любой
+-- посетитель сайта мог бы спросить кассу компании или остаток любого человека.
+-- Триггеры и crm.finance_available() вызывают их от имени владельца
+-- (security definer), так что замок продолжает работать.
+revoke all on function crm.finance_cash_value(crm.currency) from public, anon, authenticated;
+revoke all on function crm.finance_person_balance(uuid, crm.currency) from public, anon, authenticated;
+revoke all on function crm.finance_is_holder(uuid, crm.currency) from public, anon, authenticated;
+revoke all on function crm.finance_entries_guard() from public, anon, authenticated;
+revoke all on function crm.finance_advances_guard() from public, anon, authenticated;
+
+-- ---------- сверка: остатки ушли в минус ----------
+-- Замок выше не пускает НОВЫЙ расход сверх баланса, но то, что накопилось до
+-- него (расходы без прихода, перерасход подотчётных), остаётся в данных. Эта
+-- сверка называет такие места -- кассу в минусе и людей, потративших больше,
+-- чем им выдали, -- чтобы они не прятались за общей цифрой. Ничего не меняет.
+create or replace function crm.finance_balance_check()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = crm, public
+as $$
+begin
+  if auth.uid() is not null and not crm.can_view_finance() then
+    raise exception 'Недостаточно прав';
+  end if;
+  return jsonb_build_object(
+    'negative_cash', coalesce((
+      select jsonb_agg(jsonb_build_object('currency', x.c, 'value', x.v) order by x.c)
+      from (
+        select cur.c, crm.finance_cash_value(cur.c) as v
+        from (select unnest(enum_range(null::crm.currency)) as c) cur
+      ) x
+      where x.v < -0.005
+    ), '[]'::jsonb),
+    'overspent', coalesce((
+      select jsonb_agg(jsonb_build_object('email', y.email, 'currency', y.currency, 'balance', y.balance)
+                       order by y.email, y.currency)
+      from (
+        select u.email::text as email, cur.c as currency, crm.finance_person_balance(u.id, cur.c) as balance
+        from auth.users u
+        cross join (select unnest(enum_range(null::crm.currency)) as c) cur
+        where exists (select 1 from crm.finance_advances a where a.person_id = u.id)
+           or exists (
+             select 1 from crm.profiles pr
+             where pr.id = u.id and pr.role <> 'admin'
+               and coalesce(pr.finance_level, case when pr.role = 'procurement' then 'own' end) = 'own'
+           )
+      ) y
+      where y.balance < -0.005
+    ), '[]'::jsonb)
+  );
+end;
+$$;
+
+grant execute on function crm.finance_balance_check() to authenticated;
+
+-- ### 079_overdue_contracts_object_id.sql
+
+-- ============================================================
+-- 079: crm.overdue_contracts() отдаёт ещё и id квартиры (object_id).
+--
+-- ЗАЧЕМ. Список для обзвона (PDF со страницы «Должники») должен нести данные
+-- о квартире: номер, этаж, площадь. Номер квартиры нигде не хранится -- он
+-- вычисляется по положению квартиры в сетке здания, а для этого нужно знать,
+-- КАКАЯ именно квартира у договора. Названия квартиры («Кв 12») для этого мало:
+-- оно не уникально и не обязано совпадать с номером.
+--
+-- DROP нужен по той же причине, что и в блоке 045: меняется состав колонок,
+-- а `create or replace` этого не умеет. Остальное -- без изменений: те же
+-- правила просрочки, тот же порядок, security invoker (права -- как у вызывающего).
+-- Идемпотентно, данные не трогает.
+-- ============================================================
+
+drop function if exists crm.overdue_contracts(uuid);
+create function crm.overdue_contracts(p_building_id uuid default null)
+returns table (
+  contract_id uuid,
+  contract_number text,
+  client_id uuid,
+  client_name text,
+  client_phone text,
+  object_id uuid,
+  object_name text,
+  building_id uuid,
+  building_name text,
+  currency text,
+  missed_count int,
+  total_overdue numeric,
+  remaining_total numeric,
+  earliest_due date,
+  latest_due date
+)
+language sql
+stable
+security invoker
+set search_path = crm, public
+as $$
+  select
+    c.id,
+    c.number,
+    cl.id,
+    coalesce(cl.name, '—'),
+    cl.phone,
+    o.id,
+    o.name,
+    o.building_id,
+    b.name,
+    c.currency::text,
+    (count(*))::int,
+    sum(oi.unpaid_amount),
+    greatest(c.amount - c.paid_amount, 0),
+    min(oi.due_date),
+    max(oi.due_date)
+  from crm.overdue_installments oi
+  join crm.contracts c on c.id = oi.contract_id
+  left join crm.clients   cl on cl.id = c.client_id
+  left join crm.objects   o  on o.id = c.object_id
+  left join crm.buildings b  on b.id = o.building_id
+  where oi.due_date < current_date
+    and oi.unpaid_amount > 0.005
+    and (p_building_id is null or o.building_id = p_building_id)
+  group by c.id, c.number, cl.id, cl.name, cl.phone, o.id, o.name, o.building_id, b.name,
+           c.currency, c.amount, c.paid_amount
+  order by sum(oi.unpaid_amount) desc, c.id;
+$$;
+
+grant execute on function crm.overdue_contracts(uuid) to authenticated;
+
+-- ### 080_advances_breakdown_and_ledger_filter.sql
+
+-- ============================================================
+-- 080: ПОДОТЧЁТ -- видно отдельно «выдано», «возвращено», «потрачено», «на руках»,
+-- и ленту человека можно сузить до одних выдач/возвратов или одних расходов.
+--
+-- ЗАЧЕМ. На карточке сотрудника было одно «Выдано X · потрачено Y», а X --
+-- чистая сумма: возвраты в неё уже вычтены, так что вернуть деньги значило
+-- «выдать меньше», и разницы между «выдавали меньше» и «вернул» не было видно.
+-- А чтобы увидеть историю именно выдач, приходилось листать ленту, где они
+-- идут вперемешку с сотнями расходов.
+--
+--   * crm.finance_advance_people() -- в каждой валюте добавлены given (сколько
+--     выдано, без вычета возвратов) и returned (сколько вернул). Остальные поля
+--     не тронуты: старый экран продолжает работать.
+--   * crm.finance_person_ledger(..., p_kind) -- p_kind = 'advances' (выдачи и
+--     возвраты), 'expenses' (расходы) или не задан (всё вместе). Постраничность
+--     та же, по курсору: фильтр просто не читает ненужный источник.
+--
+-- DROP нужен для ленты: у функции появляется параметр, и `create or replace` с
+-- другой сигнатурой создал бы вторую перегрузку -- вызов по именам стал бы
+-- неоднозначным. Данных не трогает; идемпотентно.
+-- ============================================================
+
+create or replace function crm.finance_advance_people()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = crm, public
+as $$
+begin
+  if not crm.can_view_finance() then
+    raise exception 'Недостаточно прав';
+  end if;
+  return coalesce((
+    select jsonb_agg(p.j order by p.email)
+    from (
+      select u.email::text as email,
+             jsonb_build_object(
+               'id', u.id,
+               'email', u.email,
+               'balances', coalesce((
+                 select jsonb_agg(jsonb_build_object(
+                          'currency', k.cur,
+                          'issued', coalesce(a.issued, 0),
+                          'given', coalesce(a.given, 0),
+                          'returned', coalesce(a.returned, 0),
+                          'spent', coalesce(s.spent, 0),
+                          'balance', coalesce(a.issued, 0) - coalesce(s.spent, 0)
+                        ) order by k.cur)
+                 from (
+                   select currency::text as cur from crm.finance_advances where person_id = u.id
+                   union
+                   select currency::text from crm.finance_entries
+                   where created_by = u.id and kind = 'expense' and contract_payment_id is null
+                 ) k
+                 left join (
+                   select currency::text as cur,
+                          sum(amount) as issued,
+                          coalesce(sum(amount) filter (where amount > 0), 0) as given,
+                          coalesce(-sum(amount) filter (where amount < 0), 0) as returned
+                   from crm.finance_advances where person_id = u.id group by currency
+                 ) a on a.cur = k.cur
+                 left join (
+                   select currency::text as cur, sum(amount) as spent
+                   from crm.finance_entries
+                   where created_by = u.id and kind = 'expense' and contract_payment_id is null
+                   group by currency
+                 ) s on s.cur = k.cur
+               ), '[]'::jsonb)
+             ) as j
+      from auth.users u
+      where exists (select 1 from crm.finance_advances a where a.person_id = u.id)
+         or exists (
+           select 1 from crm.profiles pr
+           where pr.id = u.id
+             and coalesce(pr.finance_level, case pr.role when 'procurement' then 'own' end) = 'own'
+         )
+    ) p
+  ), '[]'::jsonb);
+end;
+$$;
+
+grant execute on function crm.finance_advance_people() to authenticated;
+
+drop function if exists crm.finance_person_ledger(uuid, date, timestamptz, uuid, integer);
+drop function if exists crm.finance_person_ledger(uuid, date, timestamptz, uuid, integer, text);
+create function crm.finance_person_ledger(
+  p_person_id uuid,
+  p_before_date date default null,
+  p_before_created_at timestamptz default null,
+  p_before_id uuid default null,
+  p_limit integer default 50,
+  p_kind text default null
+)
+returns jsonb
+language sql
+stable
+security invoker
+set search_path = crm, public
+as $$
+  with entries as (
+    select
+      e.id, 'expense'::text as kind, e.occurred_on as when_date, e.created_at,
+      e.amount, e.currency::text as currency, e.title,
+      c.name as category_name, c.code as category_code, b.name as building_name,
+      e.quantity, e.unit, e.unit_price, e.note as note2,
+      e.category_id, e.building_id, e.counterparty, e.contract_payment_id
+    from crm.finance_entries e
+    left join crm.finance_categories c on c.id = e.category_id
+    left join crm.buildings b on b.id = e.building_id
+    where p_kind is distinct from 'advances'
+      and e.created_by = p_person_id
+      and (p_before_date is null
+           or (e.occurred_on, e.created_at, e.id) < (p_before_date, p_before_created_at, p_before_id))
+    order by e.occurred_on desc, e.created_at desc, e.id desc
+    limit p_limit
+  ),
+  advances as (
+    select
+      a.id, (case when a.amount < 0 then 'return' else 'advance' end) as kind,
+      a.given_on as when_date, a.created_at,
+      abs(a.amount) as amount, a.currency::text as currency, a.note as title,
+      null::text as category_name, null::text as category_code, null::text as building_name,
+      null::numeric as quantity, null::text as unit, null::numeric as unit_price,
+      a.given_by_label as note2,
+      null::uuid as category_id, null::uuid as building_id, null::text as counterparty,
+      null::uuid as contract_payment_id
+    from crm.finance_advances a
+    where p_kind is distinct from 'expenses'
+      and a.person_id = p_person_id
+      and (p_before_date is null
+           or (a.given_on, a.created_at, a.id) < (p_before_date, p_before_created_at, p_before_id))
+    order by a.given_on desc, a.created_at desc, a.id desc
+    limit p_limit
+  ),
+  merged as (
+    (select * from entries) union all (select * from advances)
+    order by when_date desc, created_at desc, id desc
+    limit p_limit
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', id, 'kind', kind, 'when_date', when_date, 'created_at', created_at,
+    'amount', amount, 'currency', currency, 'title', title,
+    'category_name', category_name, 'category_code', category_code,
+    'building_name', building_name, 'quantity', quantity, 'unit', unit,
+    'unit_price', unit_price, 'note', note2,
+    'category_id', category_id, 'building_id', building_id,
+    'counterparty', counterparty, 'contract_payment_id', contract_payment_id
+  ) order by when_date desc, created_at desc, id desc), '[]'::jsonb)
+  from merged;
+$$;
+
+grant execute on function crm.finance_person_ledger(uuid, date, timestamptz, uuid, integer, text) to authenticated;
+
+-- ############################################################
+-- ### 081_debtors_rework.sql
+-- ############################################################
+
+-- ============================================================
+-- 081: «Должники» -- где квартира, когда платил в последний раз,
+--      сколько платит в месяц; и «К оплате в этом месяце».
+--
+-- 1. crm.overdue_contracts() отдаёт ещё и:
+--      * object_id / object_block / object_floor -- по ним интерфейс
+--        собирает «подъезд, этаж, квартира» (номер квартиры нигде не
+--        хранится, он считается по сетке дома -- см. apartmentNumbers.ts);
+--      * last_payment_date -- дата последнего РЕАЛЬНОГО поступления
+--        (строка contract_payments с paid = true). Это «сколько времени
+--        клиент не платит» в целом, а не возраст отдельной просроченной
+--        строки графика: тот скачет каждый месяц и ничего не говорит о
+--        том, давно ли человек вообще платил. Если платежей не было
+--        совсем -- NULL;
+--      * monthly_payment -- обычный ежемесячный платёж по графику. Берётся
+--        медиана сумм строк графика, а не «последняя» или «средняя»: у
+--        графика последняя строка отличается на копейки (остаток
+--        округления), а вручную добавленная разовая строка не должна
+--        сдвигать «обычный» платёж.
+--    У функции меняется состав колонок, поэтому она пересоздаётся через
+--    drop (create or replace тут вернул бы «cannot change return type»).
+--    Дата последнего платежа и обычный платёж считаются ОДНИМ проходом по
+--    платежам должников (а не двумя подзапросами на каждого), и функция без
+--    SET search_path -- под RLS это в разы быстрее.
+--
+-- 2. crm.due_this_month_contracts() -- по каждому договору: сколько
+--    запланировано на текущий календарный месяц и сколько из этого ещё не
+--    закрыто деньгами. Раскладка поступлений -- та же, что у просрочки
+--    (представление crm.overdue_installments): деньги закрывают самые
+--    старые строки первыми, поэтому долг прошлых месяцев не «съедает»
+--    платёж этого месяца -- он учитывается в просрочке, а здесь только то,
+--    что клиент должен внести именно в этом месяце.
+--
+-- 3. crm.due_this_month_totals() -- то же, но итогом по валютам: карточка
+--    на дашборде. p_active_only повторяет правило дашборда: без выбранного
+--    ЖК достроенные дома в сводку не входят.
+--
+-- Файл идемпотентный -- можно запускать повторно.
+-- ============================================================
+
+-- ---- 1. Должники ----
+
+drop function if exists crm.overdue_contracts(uuid);
+create function crm.overdue_contracts(p_building_id uuid default null)
+returns table (
+  contract_id uuid,
+  contract_number text,
+  client_id uuid,
+  client_name text,
+  client_phone text,
+  object_id uuid,
+  object_name text,
+  object_block text,
+  object_floor integer,
+  building_id uuid,
+  building_name text,
+  currency text,
+  missed_count int,
+  total_overdue numeric,
+  remaining_total numeric,
+  earliest_due date,
+  latest_due date,
+  last_payment_date date,
+  monthly_payment numeric
+)
+language sql
+stable
+security invoker
+as $$
+  with od as (
+    select oi.contract_id,
+           (count(*))::int as missed,
+           sum(oi.unpaid_amount) as overdue,
+           min(oi.due_date) as earliest_due,
+           max(oi.due_date) as latest_due
+    from crm.overdue_installments oi
+    where oi.due_date < current_date
+      and oi.unpaid_amount > 0.005
+    group by oi.contract_id
+  ),
+  pay as (
+    select p.contract_id,
+           -- дата последнего РЕАЛЬНОГО поступления (строка с paid = true)
+           max(coalesce(p.paid_date, p.due_date)) filter (where p.paid) as last_payment_date,
+           -- обычный ежемесячный платёж: медиана неоплаченных строк графика
+           percentile_disc(0.5) within group (order by p.amount) filter (where not p.paid) as monthly_payment
+    from crm.contract_payments p
+    where p.contract_id in (select od.contract_id from od)
+    group by p.contract_id
+  )
+  select
+    c.id,
+    c.number,
+    cl.id,
+    coalesce(cl.name, '—'),
+    cl.phone,
+    o.id,
+    o.name,
+    o.block,
+    o.floor,
+    o.building_id,
+    b.name,
+    c.currency::text,
+    od.missed,
+    od.overdue,
+    greatest(c.amount - c.paid_amount, 0),
+    od.earliest_due,
+    od.latest_due,
+    pay.last_payment_date,
+    pay.monthly_payment
+  from od
+  join crm.contracts c on c.id = od.contract_id
+  left join crm.clients   cl on cl.id = c.client_id
+  left join crm.objects   o  on o.id = c.object_id
+  left join crm.buildings b  on b.id = o.building_id
+  left join pay on pay.contract_id = od.contract_id
+  where p_building_id is null or o.building_id = p_building_id
+  order by od.overdue desc, c.id;
+$$;
+
+grant execute on function crm.overdue_contracts(uuid) to authenticated;
+
+
+-- ---- 2. К оплате в этом месяце: по договорам ----
+
+drop function if exists crm.due_this_month_contracts(uuid);
+create function crm.due_this_month_contracts(p_building_id uuid default null)
+returns table (
+  contract_id uuid,
+  contract_number text,
+  client_id uuid,
+  client_name text,
+  client_phone text,
+  object_id uuid,
+  object_name text,
+  object_block text,
+  object_floor integer,
+  building_id uuid,
+  building_name text,
+  currency text,
+  scheduled_amount numeric,
+  unpaid_amount numeric
+)
+language sql
+stable
+security invoker
+set search_path = crm, public
+as $$
+  select
+    c.id,
+    c.number,
+    cl.id,
+    coalesce(cl.name, '—'),
+    cl.phone,
+    o.id,
+    o.name,
+    o.block,
+    o.floor,
+    o.building_id,
+    coalesce(b.name, '—'),
+    c.currency::text,
+    sum(oi.scheduled_amount),
+    sum(oi.unpaid_amount)
+  from crm.overdue_installments oi
+  join crm.contracts c on c.id = oi.contract_id
+  left join crm.clients   cl on cl.id = c.client_id
+  left join crm.objects   o  on o.id = c.object_id
+  left join crm.buildings b  on b.id = o.building_id
+  where oi.due_date >= date_trunc('month', current_date)::date
+    and oi.due_date <  (date_trunc('month', current_date) + interval '1 month')::date
+    and (p_building_id is null or o.building_id = p_building_id)
+  group by c.id, c.number, cl.id, cl.name, cl.phone,
+           o.id, o.name, o.block, o.floor, o.building_id, b.name,
+           c.currency
+  order by sum(oi.unpaid_amount) desc, c.id;
+$$;
+
+grant execute on function crm.due_this_month_contracts(uuid) to authenticated;
+
+
+-- ---- 3. К оплате в этом месяце: итог по валютам (дашборд) ----
+
+drop function if exists crm.due_this_month_totals(uuid, boolean);
+create function crm.due_this_month_totals(
+  p_building_id uuid default null,
+  p_active_only boolean default false
+)
+returns table (
+  currency text,
+  contracts int,
+  unpaid_contracts int,
+  scheduled_total numeric,
+  unpaid_total numeric
+)
+language sql
+stable
+security invoker
+set search_path = crm, public
+as $$
+  with per_contract as (
+    select
+      c.id,
+      c.currency::text          as currency,
+      sum(oi.scheduled_amount)  as scheduled,
+      sum(oi.unpaid_amount)     as unpaid
+    from crm.overdue_installments oi
+    join crm.contracts c on c.id = oi.contract_id
+    left join crm.objects   o on o.id = c.object_id
+    left join crm.buildings b on b.id = o.building_id
+    where oi.due_date >= date_trunc('month', current_date)::date
+      and oi.due_date <  (date_trunc('month', current_date) + interval '1 month')::date
+      and (p_building_id is null or o.building_id = p_building_id)
+      -- Как на дашборде: в общей сводке достроенный ЖК не участвует,
+      -- а если выбран конкретный дом -- показывается как есть.
+      and (
+        p_building_id is not null
+        or not p_active_only
+        or coalesce(b.construction_status, 'in_progress') <> 'completed'
+      )
+    group by c.id, c.currency
+  )
+  select
+    pc.currency,
+    (count(*))::int,
+    (count(*) filter (where pc.unpaid > 0.005))::int,
+    sum(pc.scheduled),
+    sum(pc.unpaid)
+  from per_contract pc
+  group by pc.currency
+  order by sum(pc.unpaid) desc;
+$$;
+
+grant execute on function crm.due_this_month_totals(uuid, boolean) to authenticated;
+
+-- PostgREST узнаёт о новых колонках/функциях по сигналу.
+notify pgrst, 'reload schema';
+
+
+notify pgrst, 'reload schema';
+
+-- ############################################################
+-- ### 082_faster_access_checks.sql
+-- ############################################################
+
+-- ============================================================
+-- 082: «Должники» и отчёты по просрочке снова укладываются в лимит времени
+--      («canceling statement due to statement timeout»).
+--
+-- ЧТО БЫЛО НЕ ТАК. Просрочка читает ВСЕ строки графика, а каждая строка
+-- проходила проверку прав (RLS) отдельным вызовом нескольких функций:
+-- «есть ли у человека роль», «из его ли ЖК эта квартира». После блока 070
+-- (уровни доступа) каждая такая проверка стала ещё и многоступенчатой
+-- (уровень -> роль -> профиль). На десятках тысяч строк графика это давало
+-- десятки секунд против разрешённых нескольких, и страница «Должники» писала
+-- «не удалось загрузить список».
+--
+-- ЧТО ИЗМЕНЕНО (права доступа те же, меняется только способ проверки):
+--  1. my_sales_level() / my_finance_level() -- один запрос к профилю вместо
+--     цепочки вложенных вызовов;
+--  2. my_building_scope() -- ЧТО видит человек, считается ОДИН РАЗ на запрос:
+--     'all' (админ; директор и бухгалтер с открытым разделом), 'assigned'
+--     (остальные -- только назначенные ЖК), 'none';
+--  3. политики чтения клиентов, квартир, договоров и платежей используют это
+--     значение как константу запроса (select ...), а не считают его заново для
+--     каждой строки. Кто что видит -- прежнее (проверено по ролям и
+--     индивидуальным уровням);
+--  4. crm.contract_baseline_plan() -- без SET, чтобы планировщик мог встроить её
+--     в запрос (на ней стоит проверка «сдвинутых графиков»).
+--
+-- Идемпотентно, данные не трогает.
+-- ============================================================
+
+create or replace function crm.my_sales_level()
+returns text
+language sql
+security definer
+set search_path = crm, public
+stable
+as $$
+  select coalesce(
+    (select case p.role
+        when 'admin' then 'write'
+        else coalesce(
+          p.sales_level,
+          case p.role when 'manager' then 'write' when 'director' then 'read' else 'none' end
+        )
+      end
+     from crm.profiles p where p.id = auth.uid()),
+    'none');
+$$;
+
+create or replace function crm.my_finance_level()
+returns text
+language sql
+security definer
+set search_path = crm, public
+stable
+as $$
+  select coalesce(
+    (select case p.role
+        when 'admin' then 'write'
+        else coalesce(
+          p.finance_level,
+          case p.role when 'accountant' then 'write' when 'director' then 'read' when 'procurement' then 'own' else 'none' end
+        )
+      end
+     from crm.profiles p where p.id = auth.uid()),
+    'none');
+$$;
+
+-- Какие здания видит человек: 'all' / 'assigned' (назначенные ему ЖК) / 'none'.
+-- То же правило, что в crm.can_view_building(), но для всех зданий сразу.
+create or replace function crm.my_building_scope()
+returns text
+language sql
+security definer
+set search_path = crm, public
+stable
+as $$
+  select coalesce(
+    (select case
+        when p.role = 'admin' then 'all'
+        when p.role in ('director', 'accountant') then
+          case when crm.has_role() or crm.can_view_finance() then 'all' else 'none' end
+        else 'assigned'
+      end
+     from crm.profiles p where p.id = auth.uid()),
+    'none');
+$$;
+
+grant execute on function crm.my_building_scope() to authenticated;
+
+-- Политики чтения: константы запроса считаются один раз.
+drop policy if exists "clients_select" on crm.clients;
+create policy "clients_select" on crm.clients
+  for select to authenticated
+  using ((select crm.has_role()));
+
+drop policy if exists "objects_select" on crm.objects;
+create policy "objects_select" on crm.objects
+  for select to authenticated
+  using (
+    (select crm.has_role())
+    and (
+      building_id is null
+      or (select crm.my_building_scope()) = 'all'
+      or ((select crm.my_building_scope()) = 'assigned'
+          and building_id in (select mb.building_id from crm.manager_buildings mb
+                              where mb.user_id = (select auth.uid())))
+    )
+  );
+
+drop policy if exists "contracts_select" on crm.contracts;
+create policy "contracts_select" on crm.contracts
+  for select to authenticated
+  using (
+    (select crm.has_role())
+    and exists (
+      select 1 from crm.objects o
+      where o.id = contracts.object_id
+        and (
+          o.building_id is null
+          or (select crm.my_building_scope()) = 'all'
+          or ((select crm.my_building_scope()) = 'assigned'
+              and o.building_id in (select mb.building_id from crm.manager_buildings mb
+                                    where mb.user_id = (select auth.uid())))
+        )
+    )
+  );
+
+drop policy if exists "contract_payments_select" on crm.contract_payments;
+create policy "contract_payments_select" on crm.contract_payments
+  for select to authenticated
+  using (
+    (select crm.has_role())
+    and exists (
+      select 1
+      from crm.contracts c
+      join crm.objects o on o.id = c.object_id
+      where c.id = contract_payments.contract_id
+        and (
+          o.building_id is null
+          or (select crm.my_building_scope()) = 'all'
+          or ((select crm.my_building_scope()) = 'assigned'
+              and o.building_id in (select mb.building_id from crm.manager_buildings mb
+                                    where mb.user_id = (select auth.uid())))
+        )
+    )
+  );
+
+-- Без SET search_path (все имена и так с префиксом crm.), чтобы функцию можно
+-- было встроить в запрос.
+create or replace function crm.contract_baseline_plan(p_contract_id uuid)
+returns table (seq integer, due_date date, amount numeric, cum numeric, down numeric)
+language sql
+stable
+security invoker
+as $$
+  with c as (
+    select id, amount, installment_months as n,
+           coalesce(signed_date, created_at::date) as d0
+    from crm.contracts where id = p_contract_id and installment_months > 0
+  ),
+  dn as (
+    select c.id, c.n, c.d0,
+           least(coalesce(sum(p.amount), 0), c.amount) as down,
+           c.amount - least(coalesce(sum(p.amount), 0), c.amount) as total
+    from c
+    left join crm.contract_payments p
+      on p.contract_id = c.id and p.paid and coalesce(p.paid_date, p.due_date) <= c.d0
+    group by c.id, c.n, c.d0, c.amount
+  )
+  select g.i,
+         (dn.d0 + (g.i || ' month')::interval)::date,
+         case when g.i < dn.n then floor(dn.total / dn.n * 100) / 100
+              else round((dn.total - floor(dn.total / dn.n * 100) / 100 * (dn.n - 1)) * 100) / 100 end,
+         case when g.i < dn.n then floor(dn.total / dn.n * 100) / 100 * g.i else dn.total end,
+         dn.down
+  from dn, generate_series(1, dn.n) g(i);
+$$;
+
+grant execute on function crm.contract_baseline_plan(uuid) to authenticated;
+
+notify pgrst, 'reload schema';
+
+
+notify pgrst, 'reload schema';
+
+-- ############################################################
+-- ### 083_schedule_shift_review.sql
+-- ############################################################
+
+-- ============================================================
+-- 083: карточка «График сдвинут вперёд» -- можно решить по каждому договору.
+--
+-- Карточка (блок 077) находит договоры, у которых по датам самого договора
+-- просрочка была бы больше, чем сейчас. Но такая разница бывает не только от
+-- старого блока 056: график могли ПЕРЕНЕСТИ сознательно (договорённость с
+-- клиентом, кнопка «Пересчитать график», смена суммы договора -- всё это
+-- честно начинает график заново). «Вернуть график» таким договорам выдумало бы
+-- долг, которого нет. Поэтому:
+--
+--  1. crm.schedule_shifts() теперь отдаёт и сведения для решения: дату
+--     договора, срок, сумму, сколько оплачено, с какой даты график идёт сейчас
+--     и клиента (для ссылки);
+--  2. crm.dismiss_schedule_shift(id) -- «оставить как есть»: договор больше не
+--     попадает в карточку (запоминается в crm.schedule_shift_dismissed, только
+--     администратор, пишется в журнал);
+--  3. crm.undo_restore_schedule(id) -- отменить возврат графика: прежний план
+--     берётся из crm.schedule_backup и ставится на место (только администратор).
+--
+-- Идемпотентно, данные договоров сама не меняет.
+-- ============================================================
+
+create table if not exists crm.schedule_shift_dismissed (
+  contract_id uuid primary key references crm.contracts(id) on delete cascade,
+  dismissed_by uuid,
+  dismissed_at timestamptz not null default now()
+);
+
+alter table crm.schedule_shift_dismissed enable row level security;
+drop policy if exists "schedule_shift_dismissed_select" on crm.schedule_shift_dismissed;
+create policy "schedule_shift_dismissed_select" on crm.schedule_shift_dismissed
+  for select to authenticated using (crm.is_admin());
+revoke all on crm.schedule_shift_dismissed from anon;
+grant select on crm.schedule_shift_dismissed to authenticated;
+grant all on crm.schedule_shift_dismissed to service_role;
+
+-- Состав колонок изменился -- create or replace не умеет, поэтому drop.
+--
+-- Без SET search_path: все имена в запросе с префиксом crm., а с SET функция,
+-- читающая таблицы под RLS, работала в разы медленнее (проверено: 9 с против 1 с).
+drop function if exists crm.schedule_shifts();
+create function crm.schedule_shifts()
+returns table (
+  contract_id uuid,
+  contract_number text,
+  client_id uuid,
+  client_name text,
+  currency text,
+  signed_date date,
+  installment_months integer,
+  contract_amount numeric,
+  paid_amount numeric,
+  next_plan_date date,
+  overdue_now numeric,
+  overdue_by_contract_date numeric
+)
+language sql
+stable
+security invoker
+
+as $$
+  with cand as (
+    select c.id, c.number, c.currency::text as cur, c.paid_amount, c.amount,
+           c.client_id, c.installment_months as months,
+           coalesce(c.signed_date, c.created_at::date) as signed,
+           coalesce(cl.name, '—') as client_name
+    from crm.contracts c
+    left join crm.clients cl on cl.id = c.client_id
+    where c.payment_type in ('installment', 'rent')
+      and c.status <> 'cancelled'
+      and c.installment_months > 0
+      and c.amount > c.paid_amount
+      and exists (select 1 from crm.contract_payments p where p.contract_id = c.id and not p.paid)
+      and not exists (select 1 from crm.schedule_shift_dismissed d where d.contract_id = c.id)
+  ),
+  -- Money received on the day of signing or earlier = the initial payment: it is not
+  -- part of the instalment plan (same rule as crm.contract_baseline_plan).
+  base as (
+    select cd.id, cd.months, cd.signed, cd.paid_amount,
+           cd.amount - least(coalesce(sum(p.amount) filter (
+             where p.paid and coalesce(p.paid_date, p.due_date) <= cd.signed), 0), cd.amount) as total,
+           least(coalesce(sum(p.amount) filter (
+             where p.paid and coalesce(p.paid_date, p.due_date) <= cd.signed), 0), cd.amount) as down
+    from cand cd
+    left join crm.contract_payments p on p.contract_id = cd.id
+    group by cd.id, cd.months, cd.signed, cd.paid_amount, cd.amount
+  ),
+  -- The plan as it was at signing: n equal parts (the last one takes the cents), month by month
+  -- from the contract date. Pure arithmetic -- no table is read here.
+  plan as (
+    select b.id, b.paid_amount, b.down,
+           (b.signed + (g.i || ' month')::interval)::date as due,
+           case when g.i < b.months then floor(b.total / b.months * 100) / 100
+                else round((b.total - floor(b.total / b.months * 100) / 100 * (b.months - 1)) * 100) / 100 end as amt,
+           case when g.i < b.months then floor(b.total / b.months * 100) / 100 * g.i else b.total end as cum
+    from base b
+    cross join lateral generate_series(1, b.months) g(i)
+  ),
+  restored as (
+    select pl.id,
+           coalesce(sum(
+             least(pl.amt, greatest(pl.cum - greatest(pl.paid_amount - pl.down, 0), 0))
+           ) filter (where pl.due < current_date), 0) as overdue
+    from plan pl
+    group by pl.id
+  ),
+  now_ as (
+    select oi.contract_id as id, sum(oi.unpaid_amount) as overdue
+    from crm.overdue_installments oi
+    where oi.due_date < current_date and oi.unpaid_amount > 0.005
+    group by oi.contract_id
+  ),
+  nxt as (
+    select p.contract_id as id, min(p.due_date) as next_date
+    from crm.contract_payments p
+    where not p.paid and p.contract_id in (select id from cand)
+    group by p.contract_id
+  )
+  select cd.id, cd.number, cd.client_id, cd.client_name, cd.cur,
+         cd.signed, cd.months, cd.amount, cd.paid_amount, nxt.next_date,
+         coalesce(n.overdue, 0), r.overdue
+  from cand cd
+  join restored r on r.id = cd.id
+  left join now_ n on n.id = cd.id
+  left join nxt on nxt.id = cd.id
+  where r.overdue > coalesce(n.overdue, 0) + 0.5
+  order by r.overdue - coalesce(n.overdue, 0) desc, cd.id;
+$$;
+
+grant execute on function crm.schedule_shifts() to authenticated;
+
+-- «Оставить как есть»: график перенесён сознательно, из карточки убрать.
+create or replace function crm.dismiss_schedule_shift(p_contract_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = crm, public
+as $$
+begin
+  if not crm.is_admin() then
+    raise exception 'Только администратор может скрыть договор из этой карточки';
+  end if;
+  if not exists (select 1 from crm.contracts where id = p_contract_id) then
+    raise exception 'Contract not found';
+  end if;
+
+  insert into crm.schedule_shift_dismissed (contract_id, dismissed_by)
+  values (p_contract_id, auth.uid())
+  on conflict (contract_id) do nothing;
+
+  insert into crm.audit_log (actor_id, action, entity_type, entity_id, details)
+  values (
+    auth.uid(), 'update', 'contract', p_contract_id,
+    jsonb_build_object(
+      'schedule_shift_dismissed', true,
+      '_context', crm.audit_context('contract', p_contract_id)
+    )
+  );
+end;
+$$;
+
+grant execute on function crm.dismiss_schedule_shift(uuid) to authenticated;
+
+-- Отменить возврат графика: последний сохранённый план ставится на место.
+create or replace function crm.undo_restore_schedule(p_contract_id uuid)
+returns integer
+language plpgsql
+security definer
+set search_path = crm, public
+as $$
+declare
+  v_at timestamptz;
+  v_rows integer;
+begin
+  if not crm.is_admin() then
+    raise exception 'Только администратор может отменить возврат графика';
+  end if;
+
+  select max(saved_at) into v_at
+  from crm.schedule_backup
+  where contract_id = p_contract_id and reason = 'restore_schedule';
+  if v_at is null then
+    raise exception 'Нет сохранённого графика для этого договора';
+  end if;
+
+  perform set_config('crm.audit_off', 'on', true);
+
+  delete from crm.contract_payments where contract_id = p_contract_id and not paid;
+
+  insert into crm.contract_payments (contract_id, due_date, amount, paid, paid_date)
+  select contract_id, due_date, amount, false, null
+  from crm.schedule_backup
+  where contract_id = p_contract_id and reason = 'restore_schedule' and saved_at = v_at;
+  get diagnostics v_rows = row_count;
+
+  delete from crm.schedule_backup
+  where contract_id = p_contract_id and reason = 'restore_schedule' and saved_at = v_at;
+
+  perform set_config('crm.audit_off', 'off', true);
+
+  insert into crm.audit_log (actor_id, action, entity_type, entity_id, details)
+  values (
+    auth.uid(), 'update', 'contract', p_contract_id,
+    jsonb_build_object(
+      'schedule_restore_undone', true,
+      'schedule_payments', v_rows,
+      '_context', crm.audit_context('contract', p_contract_id)
+    )
+  );
+  return v_rows;
+end;
+$$;
+
+grant execute on function crm.undo_restore_schedule(uuid) to authenticated;
+
+notify pgrst, 'reload schema';
+
+
+-- ### 084_due_this_month_minus_received.sql
+
+-- ============================================================
+-- 084: «К оплате в этом месяце» уменьшается, когда клиент платит В ЭТОМ месяце
+--
+-- ЧТО БЫЛО НЕ ТАК. Блок 081 считал остаток этого месяца той же раскладкой,
+-- что и просрочку: деньги закрывают самые СТАРЫЕ строки графика первыми.
+-- Клиент без долгов, заплативший за месяц, исчезал из суммы -- всё верно.
+-- Но у клиента с просрочкой платёж этого месяца уходил на старые месяцы, и
+-- строка текущего месяца оставалась «не закрытой»: человек заплатил свой
+-- ежемесячный взнос, а карточка на дашборде не менялась. Так же при
+-- частичной оплате: заплатил 4 000 из 10 000 -- в карточке всё ещё 10 000.
+--
+-- КАК СЧИТАЕМ ТЕПЕРЬ. По каждому договору, у которого есть платёж в этом
+-- месяце:
+--   запланировано  -- сумма строк графика на этот месяц (как раньше);
+--   поступило      -- сколько денег пришло в ПЛАН за этот месяц: прирост
+--                     «пула» раскладки (оплачено минус первоначальный взнос,
+--                     см. представление overdue_installments) с начала
+--                     месяца. Первоначальный взнос, внесённый в этом месяце,
+--                     в «поступило» не входит -- он не часть графика;
+--   осталось       -- меньшее из двух:
+--                       * остаток строк месяца по старой раскладке (учитывает
+--                         предоплату, внесённую раньше), и
+--                       * запланировано минус поступило в этом месяце.
+-- Долг прошлых месяцев по-прежнему виден в «Должниках» и «Просрочено»; он не
+-- «съедается» и не прячется -- просто платёж этого месяца считается платежом
+-- этого месяца.
+--
+-- Меняются два представления данных: новое представление
+-- crm.due_this_month_by_contract (одна строка на договор) и обе функции
+-- due_this_month_contracts() / due_this_month_totals() -- сигнатуры и состав
+-- колонок те же, интерфейс не трогаем. set search_path у функций убран: под
+-- RLS он замедляет вызов (см. блок 082); таблицы везде указаны с схемой.
+--
+-- Идемпотентно, данные не трогает.
+-- ============================================================
+
+create or replace view crm.due_this_month_by_contract
+with (security_invoker = on)
+as
+with bounds as (
+  select date_trunc('month', current_date)::date                       as m0,
+         (date_trunc('month', current_date) + interval '1 month')::date as m1
+),
+month_rows as (
+  select oi.contract_id,
+         sum(oi.scheduled_amount) as scheduled,
+         sum(oi.unpaid_amount)    as unpaid_fifo
+  from crm.overdue_installments oi, bounds b
+  where oi.due_date >= b.m0
+    and oi.due_date <  b.m1
+  group by oi.contract_id
+),
+plan_total as (
+  select p.contract_id, sum(p.amount) as plan_total
+  from crm.contract_payments p
+  where not p.paid
+    and p.contract_id in (select contract_id from month_rows)
+  group by p.contract_id
+),
+received as (
+  select p.contract_id, sum(p.amount) as received
+  from crm.contract_payments p, bounds b
+  where p.paid
+    and coalesce(p.paid_date, p.due_date) >= b.m0
+    and p.contract_id in (select contract_id from month_rows)
+  group by p.contract_id
+)
+select
+  mr.contract_id,
+  mr.scheduled as scheduled_amount,
+  least(mr.unpaid_fifo, greatest(mr.scheduled - applied.v, 0)) as unpaid_amount
+from month_rows mr
+join crm.contracts c on c.id = mr.contract_id
+left join plan_total pt on pt.contract_id = mr.contract_id
+left join received   r  on r.contract_id  = mr.contract_id
+cross join lateral (
+  -- Сколько денег легло на ПЛАН за этот месяц: пул сейчас минус пул на начало месяца.
+  select greatest(c.paid_amount - (c.amount - coalesce(pt.plan_total, 0)), 0)
+       - greatest(c.paid_amount - coalesce(r.received, 0) - (c.amount - coalesce(pt.plan_total, 0)), 0) as v
+) applied;
+
+grant select on crm.due_this_month_by_contract to authenticated;
+
+
+create or replace function crm.due_this_month_contracts(p_building_id uuid default null)
+returns table (
+  contract_id uuid,
+  contract_number text,
+  client_id uuid,
+  client_name text,
+  client_phone text,
+  object_id uuid,
+  object_name text,
+  object_block text,
+  object_floor integer,
+  building_id uuid,
+  building_name text,
+  currency text,
+  scheduled_amount numeric,
+  unpaid_amount numeric
+)
+language sql
+stable
+security invoker
+as $$
+  select
+    c.id,
+    c.number,
+    cl.id,
+    coalesce(cl.name, '—'),
+    cl.phone,
+    o.id,
+    o.name,
+    o.block,
+    o.floor,
+    o.building_id,
+    coalesce(b.name, '—'),
+    c.currency::text,
+    d.scheduled_amount,
+    d.unpaid_amount
+  from crm.due_this_month_by_contract d
+  join crm.contracts c on c.id = d.contract_id
+  left join crm.clients   cl on cl.id = c.client_id
+  left join crm.objects   o  on o.id = c.object_id
+  left join crm.buildings b  on b.id = o.building_id
+  where (p_building_id is null or o.building_id = p_building_id)
+  order by d.unpaid_amount desc, c.id;
+$$;
+
+grant execute on function crm.due_this_month_contracts(uuid) to authenticated;
+
+
+create or replace function crm.due_this_month_totals(
+  p_building_id uuid default null,
+  p_active_only boolean default false
+)
+returns table (
+  currency text,
+  contracts int,
+  unpaid_contracts int,
+  scheduled_total numeric,
+  unpaid_total numeric
+)
+language sql
+stable
+security invoker
+as $$
+  select
+    c.currency::text,
+    (count(*))::int,
+    (count(*) filter (where d.unpaid_amount > 0.005))::int,
+    sum(d.scheduled_amount),
+    sum(d.unpaid_amount)
+  from crm.due_this_month_by_contract d
+  join crm.contracts c on c.id = d.contract_id
+  left join crm.objects   o on o.id = c.object_id
+  left join crm.buildings b on b.id = o.building_id
+  where (p_building_id is null or o.building_id = p_building_id)
+    -- Как на дашборде: в общей сводке достроенный ЖК не участвует,
+    -- а если выбран конкретный дом -- показывается как есть.
+    and (
+      p_building_id is not null
+      or not p_active_only
+      or coalesce(b.construction_status, 'in_progress') <> 'completed'
+    )
+  group by c.currency
+  order by sum(d.unpaid_amount) desc;
+$$;
+
+grant execute on function crm.due_this_month_totals(uuid, boolean) to authenticated;
+
+notify pgrst, 'reload schema';
