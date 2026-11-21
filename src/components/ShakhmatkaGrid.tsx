@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { justWentBack } from "@/lib/useScrollMemory";
 import { useLocale } from "@/lib/i18n/LocaleProvider";
@@ -8,7 +8,6 @@ import { CELL_COLORS, STATUS_COLORS, STATUS_PROGRESS_COLORS, formatArea } from "
 import { STATUS_HUES } from "@/components/charts/palette";
 import { formatCurrency, type Currency } from "@/lib/currency";
 import { RESIDENTIAL_TYPES, computeApartmentNumbers, orderBlocks } from "@/lib/buildings/apartmentNumbers";
-import { ControlGroup, GroupDivider, PillButton } from "@/components/ActionBar";
 import type { ObjectStatus, PropertyObject } from "@/lib/objects/types";
 
 export type UnitContractInfo = {
@@ -29,28 +28,37 @@ export type UnitContractInfo = {
 // "+" slots -- is derived from this, so changing it moves them all together.
 const CELL = 72;
 const GAP = 8;
+// Shops, offices and parking bays are drawn roomier than flats: a slightly wider and taller
+// cell, a wider gap between neighbours, no thick coloured ring. They used to be packed in
+// the flats' own cell with an amber ring and read as coarse and cramped.
+const CALM_W = 80;
+const CALM_H = 68;
+const CALM_GAP = 12;
 
 // Apartments and houses are the "main" shakhmatka. Everything else (shops,
-// offices, parking, land, construction) is non-residential and lives in its
-// own section below -- so a basement full of parking bays, or a strip of
-// shops, can never stretch the apartment grid or shove entrances apart.
+// offices, parking, land, construction) is non-residential and is drawn as a
+// second zone under the flats -- same entrance columns, its own floor rows --
+// so a basement full of parking bays, or a strip of shops, can never stretch
+// the apartment rows or shove entrances apart.
 function isResidential(u: PropertyObject): boolean {
   return RESIDENTIAL_TYPES.has(u.type ?? "apartment");
 }
-// Order non-residential groups predictably.
-const NON_RES_ORDER = ["commercial", "office", "parking", "land", "construction_site"];
 
-// Non-residential units are marked visually distinct from flats: a coloured
-// ring, a slight separation, and a purpose prefix on the number so a
-// ground-floor shop reads "М1", a parking bay "П1", an office "О1" -- never
-// confused with apartment "1". Apartments/houses have no prefix or ring.
-const TYPE_META: Record<string, { prefix: string; ring: string }> = {
-  commercial: { prefix: "М", ring: "ring-2 ring-amber-400" },
-  office: { prefix: "О", ring: "ring-2 ring-sky-400" },
-  parking: { prefix: "П", ring: "ring-2 ring-slate-400" },
-  land: { prefix: "З", ring: "ring-2 ring-lime-400" },
-  construction_site: { prefix: "С", ring: "ring-2 ring-orange-400" },
+// Non-residential units are told apart from flats by a purpose prefix on the number -- a
+// ground-floor shop reads "М1", a parking bay "П1", an office "О1", never confused with
+// apartment "1" -- and by sitting in their own zone with their own, roomier cell.
+const TYPE_PREFIX: Record<string, string> = {
+  commercial: "М",
+  office: "О",
+  parking: "П",
+  land: "З",
+  construction_site: "С",
 };
+
+// The width of one cell: a flat is CELL wide per slot it spans, a shop/office/bay CALM_W.
+function cellWidth(span: number, calm: boolean): number {
+  return calm ? span * CALM_W + (span - 1) * CALM_GAP : span * CELL + (span - 1) * GAP;
+}
 
 
 // A flat that cannot be sold as it stands. These are the ones the dashboard
@@ -117,6 +125,7 @@ function UnitCell({
   gapFilter,
   editMode,
   openUpward = false,
+  calm = false,
 }: {
   unit: PropertyObject;
   apartmentNumber: number | undefined;
@@ -143,6 +152,8 @@ function UnitCell({
   // hovering anything. Opening upward for the last few rows means that
   // padding is no longer load-bearing and can shrink back down to nothing.
   openUpward?: boolean;
+  // Shops, offices, parking: the roomier cell (see CALM_*).
+  calm?: boolean;
 }) {
   const { t } = useLocale();
   const router = useRouter();
@@ -155,7 +166,7 @@ function UnitCell({
     `/contracts/${contractId}/payments?from=${encodeURIComponent(pathname)}`;
 
   const span = unit.span || 1;
-  const width = span * CELL + (span - 1) * GAP;
+  const width = cellWidth(span, calm);
   const nextUnit = floorUnits.find(
     (u) => u.position_in_floor === (unit.position_in_floor ?? 0) + span
   );
@@ -170,7 +181,7 @@ function UnitCell({
     (statusFilter !== null && unit.status !== statusFilter) ||
     (roomsFilter !== null && unit.rooms !== roomsFilter) ||
     (gapFilter !== null && !hasGap(unit, gapFilter));
-  const typeMeta = TYPE_META[unit.type ?? "apartment"];
+  const prefix = TYPE_PREFIX[unit.type ?? "apartment"];
 
   // Payment standing of this cell. Only meaningful where there IS a contract:
   // a free flat owes nothing and must not look like a fully paid one.
@@ -242,18 +253,18 @@ function UnitCell({
           }
         }}
         disabled={isPending}
-        style={{ width }}
-        className={`relative flex h-16 flex-col items-center justify-center overflow-hidden rounded-md text-[11px] font-semibold leading-tight transition-all hover:scale-105 hover:ring-2 hover:ring-offset-1 hover:ring-[color-mix(in_srgb,var(--brand)_45%,transparent)] ${
-          isPending ? "animate-pulse opacity-60" : ""
-        } ${dimmed ? "opacity-20 saturate-0" : ""} ${
-          typeMeta ? `${typeMeta.ring} ring-offset-1` : ""
+        style={calm ? { width, height: CALM_H } : { width }}
+        className={`relative flex flex-col items-center justify-center overflow-hidden text-[11px] leading-tight transition-all hover:scale-105 hover:ring-2 hover:ring-offset-1 hover:ring-[color-mix(in_srgb,var(--brand)_45%,transparent)] ${
+          calm ? "rounded-xl font-medium" : "h-16 rounded-md font-semibold"
+        } ${isPending ? "animate-pulse opacity-60" : ""} ${
+          dimmed ? "opacity-20 saturate-0" : ""
         } ${CELL_COLORS[unit.status]}`}
       >
         {/* The number stays where it always was (centre), lifted a little to leave room
             for the area under it; rooms and area are small and quiet so they never
             compete with it. A flat with no rooms or no area simply shows nothing there. */}
-        <span className="pb-1.5 text-[15px] font-semibold leading-none">
-          {typeMeta?.prefix}
+        <span className={`pb-1.5 text-[15px] leading-none ${calm ? "font-medium" : "font-semibold"}`}>
+          {prefix}
           {apartmentNumber ?? "—"}
         </span>
         {unit.rooms != null && unit.rooms > 0 && (
@@ -571,28 +582,25 @@ export function ShakhmatkaGrid({
   // entrance you made sits leftmost and each new one appears to its right. The
   // flat numbers use the very same function, so they follow this layout.
   const gridUnits = residentialUnits.length > 0 ? residentialUnits : units;
-  const blocks = orderBlocks(gridUnits);
+  // Shops, offices, parking and the rest are drawn as a second zone UNDER the flats, in the
+  // same entrance columns, so one look at the grid shows what is where in the building:
+  // flats above, commercial floors below. They never widen or renumber the flats' rows (each
+  // zone only pads a column to its own widest floor). A building with no flats at all draws
+  // them in the main rows, in the same roomier cell.
+  const zoneUnits = residentialUnits.length > 0 ? otherUnits : [];
+  const mainCalm = residentialUnits.length === 0;
+  const blocks = orderBlocks([...gridUnits, ...zoneUnits]);
   const hasBlocks = blocks.length > 1 || blocks[0] !== "";
   const floors = Array.from(new Set(gridUnits.map((u) => u.floor ?? 0))).sort((a, b) => b - a);
-
-  // Widest floor of each block, measured by how many units it actually has
-  // (not by stored position values). This is what pins the block's column
-  // width. Measuring by position let a stray high-position unit -- left by a
-  // construction glitch -- reserve a huge empty column and shove the next
-  // entrance far to the right.
-  const maxUnitsByBlock = new Map<string, number>();
-  for (const block of blocks) {
-    const perFloor = new Map<number, number>();
-    for (const u of gridUnits) {
-      if ((u.block ?? "") !== block) continue;
-      const f = u.floor ?? 0;
-      perFloor.set(f, (perFloor.get(f) ?? 0) + (u.span || 1));
-    }
-    maxUnitsByBlock.set(block, Math.max(0, ...perFloor.values()));
-  }
+  const zoneFloors = Array.from(new Set(zoneUnits.map((u) => u.floor ?? 0))).sort((a, b) => b - a);
 
   type Slot = { kind: "unit"; unit: PropertyObject } | { kind: "ghost"; position: number };
-  function floorSlots(block: string, floor: number, cellUnits: PropertyObject[]): Slot[] {
+  function floorSlots(
+    block: string,
+    floor: number,
+    cellUnits: PropertyObject[],
+    ghosts: boolean
+  ): Slot[] {
     // Pack the floor's units left-to-right in order, ignoring gaps in their
     // stored positions -- so a floor always shows exactly as many cells as it
     // has units, side by side, with no confusing empty holes. One trailing
@@ -601,7 +609,7 @@ export function ShakhmatkaGrid({
       (a, b) => (a.position_in_floor ?? 0) - (b.position_in_floor ?? 0)
     );
     const slots: Slot[] = sorted.map((unit) => ({ kind: "unit" as const, unit }));
-    if (!readOnly) {
+    if (!readOnly && ghosts) {
       const last = sorted[sorted.length - 1];
       const nextPos = last ? (last.position_in_floor ?? sorted.length) + 1 : 1;
       slots.push({ kind: "ghost", position: nextPos });
@@ -609,13 +617,51 @@ export function ShakhmatkaGrid({
     return slots;
   }
 
-  // Pin every block's column to its widest floor (units + a trailing add-slot)
-  // so entrances line up cleanly and sit right next to each other.
+  // Pin every block's column to its widest floor (units + a trailing add-slot) so entrances
+  // line up cleanly and sit right next to each other. A floor is measured by the units it
+  // actually has (their real cell widths), not by their stored positions: measuring by
+  // position let a stray high-position unit -- left by a construction glitch -- reserve a
+  // huge empty column and shove the next entrance far to the right. The flats' floors and the
+  // zone's floors each count in their own cell size; the column is as wide as the widest.
   const blockWidths = new Map<string, number>();
   for (const block of blocks) {
-    const slotCount = (maxUnitsByBlock.get(block) ?? 0) + (readOnly ? 0 : 1);
-    blockWidths.set(block, slotCount * CELL + Math.max(0, slotCount - 1) * GAP);
+    // A flats floor always has its trailing "+" (unless read-only), even with no units yet.
+    let widest = !readOnly && gridUnits.length > 0 ? CELL : 0;
+    const lists: Array<[PropertyObject[], boolean, boolean]> = [
+      [gridUnits, mainCalm, !readOnly],
+      [zoneUnits, true, false],
+    ];
+    for (const [list, calm, ghost] of lists) {
+      const gap = calm ? CALM_GAP : GAP;
+      const perFloor = new Map<number, { width: number; count: number }>();
+      for (const u of list) {
+        if ((u.block ?? "") !== block) continue;
+        const f = u.floor ?? 0;
+        const acc = perFloor.get(f) ?? { width: 0, count: 0 };
+        acc.width += cellWidth(u.span || 1, calm);
+        acc.count += 1;
+        perFloor.set(f, acc);
+      }
+      for (const { width, count } of perFloor.values()) {
+        widest = Math.max(widest, width + (count - 1) * gap + (ghost ? gap + CELL : 0));
+      }
+    }
+    blockWidths.set(block, widest);
   }
+
+  // The rows of the grid, top to bottom: the flats' floors, then (if there is anything but
+  // flats) a divider and the commercial floors.
+  type FloorRow =
+    | { kind: "floor"; floor: number; source: PropertyObject[]; zone: boolean; index: number }
+    | { kind: "divider" };
+  const floorRows: FloorRow[] = [
+    ...floors.map((floor, index) => ({ kind: "floor" as const, floor, source: gridUnits, zone: false, index })),
+    ...(zoneFloors.length > 0 ? [{ kind: "divider" as const }] : []),
+    ...zoneFloors.map((floor, index) => ({ kind: "floor" as const, floor, source: zoneUnits, zone: true, index })),
+  ];
+  // Blocks sit in a "gap-4" row (16px) after the 64px floor label.
+  const rowWidth =
+    blocks.reduce((sum, b) => sum + (blockWidths.get(b) ?? 0), 0) + Math.max(0, blocks.length - 1) * 16;
 
   return (
     <div className="flex min-w-0 max-w-full flex-col gap-4">
@@ -658,27 +704,48 @@ export function ShakhmatkaGrid({
             </div>
           )}
 
-          {floors.map((floor, floorIndex) => {
+          {floorRows.map((row) => {
+            if (row.kind === "divider") {
+              return (
+                <div key="zone-divider" className="flex items-center gap-3 pt-3">
+                  <span className="w-16 shrink-0" />
+                  <div style={{ width: rowWidth }} className="border-t border-[var(--border-c)] pt-1.5">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-[var(--ink-4)]">
+                      {t.buildings.commercialZone}
+                      <span className="ml-2 font-normal normal-case tracking-normal text-[var(--ink-5)]">
+                        ({zoneUnits.length})
+                      </span>
+                    </p>
+                  </div>
+                </div>
+              );
+            }
+            const { floor, source, zone } = row;
             // The hover card is up to ~260px tall (roughly 4 rows) -- any
             // row with fewer than 4 rows left below it flips its card
             // upward instead, so it always has somewhere to render into.
-            const openUpward = floorIndex >= floors.length - 4;
+            // The commercial zone is the bottom of the grid, so all of it opens upward.
+            const openUpward = zone || row.index >= floors.length - 4;
+            // Shops/offices/bays sit in the roomier cell: a wider gap, and more air between rows.
+            const calm = zone || mainCalm;
             return (
-            <div key={floor} className="flex items-center gap-3">
+            <div key={`${zone ? "z" : "m"}-${floor}`} className={`flex items-center gap-3 ${calm ? "py-1" : ""}`}>
               <span className="w-16 shrink-0 text-xs font-medium text-[var(--ink-4)]">
                 {t.buildings.floorLabel} {floor}
               </span>
               <div className="flex gap-4">
                 {blocks.map((block) => {
-                  const cellUnits = gridUnits
+                  const cellUnits = source
                     .filter((u) => (u.block ?? "") === block && (u.floor ?? 0) === floor)
                     .sort((a, b) => (a.position_in_floor ?? 0) - (b.position_in_floor ?? 0));
-                  const slots = floorSlots(block, floor, cellUnits);
+                  // No "+" add-slot in the commercial zone: a new cell there would be born
+                  // as a flat. Commercial premises are added in the structure editor.
+                  const slots = floorSlots(block, floor, cellUnits, !zone);
                   return (
                     <div
                       key={block}
                       style={{ width: blockWidths.get(block) }}
-                      className="flex shrink-0 flex-nowrap gap-2"
+                      className={`flex shrink-0 flex-nowrap ${calm ? "gap-3" : "gap-2"}`}
                     >
                       {slots.map((slot) =>
                         slot.kind === "unit" ? (
@@ -703,6 +770,7 @@ export function ShakhmatkaGrid({
                             gapFilter={gapFilter}
                             editMode={editMode}
                             openUpward={openUpward}
+                            calm={calm}
                           />
                         ) : canEditSold ? (
                           <button
@@ -730,98 +798,6 @@ export function ShakhmatkaGrid({
           })}
         </div>
       </div>
-
-      {/* Non-residential units (shops, offices, parking, land, construction)
-          live in their own section so they never stretch or space out the main
-          apartment shakhmatka above. Each type wraps freely, so a basement of
-          40 parking bays just flows onto more rows instead of widening a
-          column. */}
-      {otherUnits.length > 0 && (
-        <div className="flex flex-col gap-4 border-t border-[var(--border-c)] pt-4">
-          {NON_RES_ORDER.map((type) => {
-            const group = otherUnits
-              .filter((u) => (u.type ?? "apartment") === type)
-              .sort((a, b) => {
-                const bc = (a.block ?? "").localeCompare(b.block ?? "");
-                if (bc !== 0) return bc;
-                const fa = a.floor ?? 0;
-                const fb = b.floor ?? 0;
-                if (fa !== fb) return fa - fb;
-                return (a.position_in_floor ?? 0) - (b.position_in_floor ?? 0);
-              });
-            if (group.length === 0) return null;
-            const meta = TYPE_META[type];
-            // Split each type by block/entrance so two blocks' commercial
-            // units don't run together into one row with restarting numbers
-            // (М1…М26, then М1… again). Each block gets its own labelled grid.
-            const typeBlocks = orderBlocks(group);
-            return (
-              <div key={type} className="flex flex-col gap-2.5">
-                <p className="flex items-center gap-2 text-sm font-semibold text-[var(--ink-2)]">
-                  {meta && (
-                    <span
-                      className={`inline-flex h-5 min-w-5 items-center justify-center rounded px-1 text-[11px] ${meta.ring} ring-offset-1`}
-                    >
-                      {meta.prefix}
-                    </span>
-                  )}
-                  {t.objects.types[type as keyof typeof t.objects.types] ?? type}
-                  <span className="text-xs font-normal text-[var(--ink-5)]">
-                    ({group.length})
-                  </span>
-                </p>
-                {typeBlocks.map((block) => {
-                  const cells = group.filter((u) => (u.block ?? "") === block);
-                  return (
-                    <div key={block} className="flex flex-col gap-1.5">
-                      {block && (
-                        <p className="text-xs font-medium text-[var(--ink-4)]">
-                          {block} <span className="text-[var(--ink-5)]">({cells.length})</span>
-                        </p>
-                      )}
-                      {/* A real grid (fixed CELL-wide columns) so the cells line
-                          up tidily; a merged (span>1) cell spans that many
-                          columns and still aligns. */}
-                      <div
-                        className="grid justify-start gap-2"
-                        style={{ gridTemplateColumns: `repeat(auto-fill, ${CELL}px)` }}
-                      >
-                        {cells.map((unit) => (
-                          <div
-                            key={unit.id}
-                            style={{ gridColumn: `span ${unit.span || 1}` }}
-                          >
-                            <UnitCell
-                              unit={unit}
-                              apartmentNumber={apartmentNumbers.get(unit.id)}
-                              floorUnits={cells}
-                              contractInfo={contractsByUnit[unit.id]}
-                              onBookUnit={onBookUnit}
-                              onQuickBook={onQuickBook}
-                              onCancelQuickBook={onCancelQuickBook}
-                              isPending={pendingUnitIds.has(unit.id)}
-                              onMergeUnits={onMergeUnits}
-                              onSplitUnit={onSplitUnit}
-                              onDeleteUnit={onDeleteUnit}
-                              canEditSold={canEditSold}
-                              readOnly={readOnly}
-                              onViewUnit={onViewUnit}
-                              statusFilter={statusFilter}
-                              roomsFilter={roomsFilter}
-                              gapFilter={gapFilter}
-                              editMode={editMode}
-                            />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            );
-          })}
-        </div>
-      )}
 
       {/* What the bar and the tick on a cell mean. This is a reading key, not
           a control, and it used to sit in the filter row -- which made that
@@ -859,15 +835,16 @@ export function ShakhmatkaGrid({
   );
 }
 
-// The filter bar, lifted out of the grid so it can sit on the page header
-// line beside the icon toolbar instead of on a row of its own.
+// The filter bar, lifted out of the grid so it sits on the line under the page header.
 //
-// Everything here is one bordered group with internal dividers, the same
-// primitive the icon toolbar uses. Before, the statuses were separate loose
-// pills, the rooms were a second bordered box with a text label in front of
-// it, and the payment key was a third cluster after that -- three unrelated
-// shapes strung across the full width. Glued, at the toolbar's own size, it
-// reads as one control and takes roughly half the room.
+// It used to be one long strip of pills -- every status, every room count, the "no price /
+// no area" keys -- that was wider than a phone and scrolled sideways inside its own box. Now
+// the bar holds only what is used all the time: ONE segmented control for the status
+// ("Все / Свободно / Бронь / Продано", each with its count) and a "Фильтры" button. The
+// rest -- room counts, the flats with no price or no area and the rarer statuses -- lives in
+// the panel that button opens; whatever is switched on there is shown back as small
+// removable chips beside the button, so you can always see (and undo) what narrows the grid
+// without opening anything.
 export function ShakhmatkaFilters({
   units,
   statusFilter,
@@ -886,16 +863,37 @@ export function ShakhmatkaFilters({
   onGapChange: (next: GapFilter) => void;
 }) {
   const { t } = useLocale();
+  const f = t.buildings.filters;
+  const [open, setOpen] = useState(false);
+  const boxRef = useRef<HTMLDivElement>(null);
 
-  // The three statuses core to selling are always offered, so it never looks
-  // like "sold" quietly disappeared just because nothing has that status yet.
-  // The two rarer ones appear only when actually used.
-  const CORE_STATUSES: ObjectStatus[] = ["available", "reserved", "sold"];
-  const presentStatuses = (
-    Object.keys(t.buildings.legend) as Array<keyof typeof t.buildings.legend>
-  ).filter(
-    (status) => CORE_STATUSES.includes(status) || units.some((u) => u.status === status)
+  // Close the panel on a click anywhere else and on Escape.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  // The three statuses core to selling are always in the bar, so it never looks like "sold"
+  // quietly disappeared because nothing has that status yet. The two rarer ones (rented, in
+  // progress) are offered in the panel, and only when some unit actually has them.
+  const BAR_STATUSES: ObjectStatus[] = ["available", "reserved", "sold"];
+  const statusCounts = new Map<ObjectStatus, number>();
+  for (const u of units) statusCounts.set(u.status, (statusCounts.get(u.status) ?? 0) + 1);
+  const rareStatuses = (Object.keys(t.buildings.legend) as ObjectStatus[]).filter(
+    (s) => !BAR_STATUSES.includes(s) && (statusCounts.get(s) ?? 0) > 0
   );
+  const barLabel = (s: ObjectStatus) => (s === "reserved" ? f.reservedShort : t.buildings.legend[s]);
 
   // Room counts come from the units of THIS building, not a fixed 1/2/3 list.
   const roomCounts = new Map<number, number>();
@@ -905,118 +903,263 @@ export function ShakhmatkaFilters({
   }
   const presentRooms = Array.from(roomCounts.keys()).sort((a, b) => a - b);
 
-  // The dashboard says "N без цены — в сумму не вошли" and there was nowhere
-  // to go and look at them. These two pills appear only when such flats exist,
-  // and they separate the two very different reasons: no price is fixable by
-  // re-saving the building's rate, no area is not -- someone has to type the
-  // area first, because the price is computed from it.
+  // The dashboard says "N без цены — в сумму не вошли" and there was nowhere to go and look at
+  // them. These two appear only when such flats exist, and they separate the two very
+  // different reasons: no price is fixable by re-saving the building's rate, no area is not --
+  // someone has to type the area first, because the price is computed from it.
   const noPriceCount = units.filter((u) => hasGap(u, "no_price")).length;
   const noAreaCount = units.filter((u) => hasGap(u, "no_area")).length;
 
-  const anyActive = statusFilter !== null || roomsFilter !== null || gapFilter !== null;
+  const rareActive = statusFilter !== null && !BAR_STATUSES.includes(statusFilter);
+  const activeCount = (roomsFilter !== null ? 1 : 0) + (gapFilter !== null ? 1 : 0) + (rareActive ? 1 : 0);
+  const anyActive = statusFilter !== null || activeCount > 0;
+  const resetAll = () => {
+    onStatusChange(null);
+    onRoomsChange(null);
+    onGapChange(null);
+  };
+
+  // A small removable chip for one active filter.
+  const chip = (key: string, label: string, onRemove: () => void) => (
+    <button
+      key={key}
+      type="button"
+      onClick={onRemove}
+      title={t.buildings.clearFilter}
+      className="inline-flex h-8 items-center gap-1.5 rounded-full bg-[var(--wash-sky)] px-3 text-xs font-medium text-[var(--wash-sky-ink)] transition-all hover:brightness-95 active:scale-95"
+    >
+      {label}
+      <span aria-hidden="true" className="text-sm leading-none opacity-70">
+        ×
+      </span>
+    </button>
+  );
+
+  const optionClass = (active: boolean) =>
+    `inline-flex h-8 items-center gap-1.5 whitespace-nowrap rounded-lg border px-3 text-xs font-medium transition-all active:scale-[0.97] ${
+      active
+        ? "border-transparent bg-brand text-white shadow-sm"
+        : "border-[var(--border-c)] bg-[var(--surface-1)] text-[var(--ink-3)] hover:bg-[var(--hover-c2)]"
+    }`;
 
   return (
-    <ControlGroup scrollable>
-      {presentStatuses.map((status) => {
-        const active = statusFilter === status;
-        return (
-          <PillButton
-            key={status}
-            active={active}
-            onClick={() => onStatusChange(active ? null : status)}
-            label={
-              <span className="flex items-center gap-1.5">
+    <div ref={boxRef} className="relative flex flex-wrap items-center gap-2">
+      {/* Status as one segmented control: the active segment is a raised pill, the rest are
+          quiet text. On a phone it spans the row and the segments share it by their content
+          (a long label is trimmed rather than pushing the row wider than the screen); from
+          the sm breakpoint up it is only as wide as it needs to be. */}
+      <div
+        role="group"
+        className="flex w-full min-w-0 items-center gap-0.5 rounded-xl bg-[var(--hover-c2)] p-0.5 sm:inline-flex sm:w-auto"
+      >
+        {[null, ...BAR_STATUSES].map((s) => {
+          const active = statusFilter === s;
+          const count = s === null ? units.length : (statusCounts.get(s) ?? 0);
+          return (
+            <button
+              key={s ?? "all"}
+              type="button"
+              onClick={() => onStatusChange(s)}
+              aria-pressed={active}
+              className={`inline-flex h-8 min-w-0 flex-auto items-center justify-center gap-1 whitespace-nowrap rounded-[10px] px-1.5 text-xs font-medium transition-all active:scale-[0.97] sm:flex-none sm:px-3 ${
+                active
+                  ? "bg-[var(--surface-1)] text-[var(--ink-1)] shadow-sm"
+                  : "text-[var(--ink-4)] hover:text-[var(--ink-2)]"
+              }`}
+            >
+              {s !== null && (
                 <span
-                  className={`h-2 w-2 shrink-0 rounded-full ${
-                    // On the brand fill the green "available" dot all but
-                    // vanishes on the emerald theme; a hairline ring keeps
-                    // every dot legible whatever colour sits behind it.
-                    active ? "ring-1 ring-white/70 dark:ring-black/60" : ""
-                  }`}
-                  style={{ background: STATUS_HUES[status].solid }}
+                  aria-hidden="true"
+                  className="h-2 w-2 shrink-0 rounded-full"
+                  style={{ background: STATUS_HUES[s].solid }}
                 />
-                {t.buildings.legend[status]}
-              </span>
-            }
+              )}
+              <span className="min-w-0 truncate">{s === null ? f.all : barLabel(s)}</span>
+              <span className={active ? "text-[var(--ink-4)]" : "text-[var(--ink-5)]"}>{count}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className={`inline-flex h-9 items-center gap-1.5 rounded-xl border px-3 text-xs font-medium transition-all active:scale-[0.97] ${
+          open || activeCount > 0
+            ? "border-[var(--brand)] text-[var(--ink-1)]"
+            : "border-[var(--border-strong-c)] text-[var(--ink-3)] hover:bg-[var(--hover-c2)]"
+        } bg-[var(--surface-1)]`}
+      >
+        <svg
+          viewBox="0 0 24 24"
+          className="h-4 w-4"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M4 6h16M7 12h10M10 18h4" />
+        </svg>
+        {f.button}
+        {activeCount > 0 && (
+          <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[10px] font-semibold text-white">
+            {activeCount}
+          </span>
+        )}
+      </button>
+
+      {roomsFilter !== null &&
+        chip("rooms", `${roomsFilter} ${t.buildings.roomsFilterShort}`, () => onRoomsChange(null))}
+      {gapFilter !== null &&
+        chip(
+          "gap",
+          gapFilter === "no_price" ? t.buildings.noPriceFilter : t.buildings.noAreaFilter,
+          () => onGapChange(null)
+        )}
+      {rareActive && statusFilter !== null &&
+        chip("status", t.buildings.legend[statusFilter], () => onStatusChange(null))}
+      {anyActive && activeCount > 1 && (
+        <button
+          type="button"
+          onClick={resetAll}
+          className="h-8 rounded-lg px-2 text-xs font-medium text-[var(--ink-4)] transition-colors hover:text-[var(--ink-2)]"
+        >
+          {f.reset}
+        </button>
+      )}
+
+      {open && (
+        <>
+          {/* On a phone the panel is a sheet above the tab bar, with the page dimmed behind it;
+              from the sm breakpoint up it hangs under the button like a menu. */}
+          <button
+            type="button"
+            aria-label={f.reset}
+            tabIndex={-1}
+            onClick={() => setOpen(false)}
+            className="fixed inset-0 z-40 bg-black/30 sm:hidden"
           />
-        );
-      })}
+          <div
+            role="dialog"
+            className="fixed inset-x-3 bottom-20 z-50 max-h-[70vh] overflow-y-auto rounded-2xl border border-[var(--border-c)] bg-[var(--surface-1)] p-4 shadow-2xl sm:absolute sm:inset-x-auto sm:bottom-auto sm:left-0 sm:top-full sm:mt-2 sm:w-80"
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <p className="text-sm font-semibold text-[var(--ink-1)]">{f.button}</p>
+              {anyActive && (
+                <button
+                  type="button"
+                  onClick={resetAll}
+                  className="text-xs font-medium text-[var(--ink-4)] transition-colors hover:text-[var(--ink-2)]"
+                >
+                  {f.reset}
+                </button>
+              )}
+            </div>
 
-      {presentRooms.length > 0 && (
-        <>
-          <GroupDivider />
-          {presentRooms.map((rooms) => {
-            const active = roomsFilter === rooms;
-            return (
-              <PillButton
-                key={rooms}
-                active={active}
-                onClick={() => onRoomsChange(active ? null : rooms)}
-                title={t.buildings.roomsFilter}
-                label={
-                  <span className="flex items-center gap-1">
-                    {rooms} {t.buildings.roomsFilterShort}
-                    <span className={active ? "opacity-70" : "text-[var(--ink-5)]"}>
-                      {roomCounts.get(rooms)}
-                    </span>
-                  </span>
-                }
-              />
-            );
-          })}
+            <div className="flex flex-col gap-4">
+              {presentRooms.length > 0 && (
+                <section>
+                  <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-[var(--ink-5)]">
+                    {t.buildings.roomsFilter}
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {presentRooms.map((rooms) => {
+                      const active = roomsFilter === rooms;
+                      return (
+                        <button
+                          key={rooms}
+                          type="button"
+                          onClick={() => onRoomsChange(active ? null : rooms)}
+                          aria-pressed={active}
+                          className={optionClass(active)}
+                        >
+                          {rooms} {t.buildings.roomsFilterShort}
+                          <span className={active ? "text-white/70" : "text-[var(--ink-5)]"}>
+                            {roomCounts.get(rooms)}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              )}
+
+              {rareStatuses.length > 0 && (
+                <section>
+                  <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-[var(--ink-5)]">
+                    {f.statusTitle}
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {rareStatuses.map((s) => {
+                      const active = statusFilter === s;
+                      return (
+                        <button
+                          key={s}
+                          type="button"
+                          onClick={() => onStatusChange(active ? null : s)}
+                          aria-pressed={active}
+                          className={optionClass(active)}
+                        >
+                          <span
+                            aria-hidden="true"
+                            className={`h-2 w-2 shrink-0 rounded-full ${active ? "ring-1 ring-white/80" : ""}`}
+                            style={{ background: STATUS_HUES[s].solid }}
+                          />
+                          {t.buildings.legend[s]}
+                          <span className={active ? "text-white/70" : "text-[var(--ink-5)]"}>
+                            {statusCounts.get(s)}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              )}
+
+              {(noPriceCount > 0 || noAreaCount > 0) && (
+                <section>
+                  <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-[var(--ink-5)]">
+                    {f.gapsTitle}
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {noPriceCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => onGapChange(gapFilter === "no_price" ? null : "no_price")}
+                        aria-pressed={gapFilter === "no_price"}
+                        title={t.buildings.noPriceFilterHint}
+                        className={optionClass(gapFilter === "no_price")}
+                      >
+                        {t.buildings.noPriceFilter}
+                        <span className={gapFilter === "no_price" ? "text-white/70" : "text-[var(--ink-5)]"}>
+                          {noPriceCount}
+                        </span>
+                      </button>
+                    )}
+                    {noAreaCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => onGapChange(gapFilter === "no_area" ? null : "no_area")}
+                        aria-pressed={gapFilter === "no_area"}
+                        title={t.buildings.noAreaFilterHint}
+                        className={optionClass(gapFilter === "no_area")}
+                      >
+                        {t.buildings.noAreaFilter}
+                        <span className={gapFilter === "no_area" ? "text-white/70" : "text-[var(--ink-5)]"}>
+                          {noAreaCount}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                </section>
+              )}
+            </div>
+          </div>
         </>
       )}
-
-      {(noPriceCount > 0 || noAreaCount > 0) && (
-        <>
-          <GroupDivider />
-          {noPriceCount > 0 && (
-            <PillButton
-              active={gapFilter === "no_price"}
-              onClick={() => onGapChange(gapFilter === "no_price" ? null : "no_price")}
-              title={t.buildings.noPriceFilterHint}
-              label={
-                <span className="flex items-center gap-1">
-                  {t.buildings.noPriceFilter}
-                  <span className={gapFilter === "no_price" ? "opacity-70" : "text-[var(--ink-5)]"}>
-                    {noPriceCount}
-                  </span>
-                </span>
-              }
-            />
-          )}
-          {noAreaCount > 0 && (
-            <PillButton
-              active={gapFilter === "no_area"}
-              onClick={() => onGapChange(gapFilter === "no_area" ? null : "no_area")}
-              title={t.buildings.noAreaFilterHint}
-              label={
-                <span className="flex items-center gap-1">
-                  {t.buildings.noAreaFilter}
-                  <span className={gapFilter === "no_area" ? "opacity-70" : "text-[var(--ink-5)]"}>
-                    {noAreaCount}
-                  </span>
-                </span>
-              }
-            />
-          )}
-        </>
-      )}
-
-      {anyActive && (
-        <>
-          <GroupDivider />
-          <PillButton
-            label="×"
-            title={t.buildings.clearFilter}
-            onClick={() => {
-              onStatusChange(null);
-              onRoomsChange(null);
-              onGapChange(null);
-            }}
-          />
-        </>
-      )}
-    </ControlGroup>
+    </div>
   );
 }

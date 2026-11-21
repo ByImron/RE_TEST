@@ -18,6 +18,8 @@ import { formatCurrency, type Currency } from "@/lib/currency";
 import { MoneyPairValue, type MoneyPair } from "@/components/MoneyPairValue";
 import { useRole } from "@/lib/auth/useRole";
 import type { ObjectStatus } from "@/lib/objects/types";
+// The real area (up to 2 decimals), never rounded to whole square metres.
+import { formatArea } from "@/lib/objects/format";
 import type { Building } from "@/lib/buildings/types";
 
 // ---------------------------------------------------------------------------
@@ -100,12 +102,6 @@ const EMPTY_SUMMARY: DashboardSummary = {
   top_debtors: [],
   completed: { buildings: 0, units: 0 },
 };
-
-const areaFormat = new Intl.NumberFormat("ru-RU");
-
-function formatArea(m2: number) {
-  return `${areaFormat.format(Math.round(m2))} м²`;
-}
 
 // Те же цвета, что в шахматке: продано красное, забронировано жёлтое,
 // свободно зелёное. Кольцо в цвете самого дома выглядело бы наряднее, но
