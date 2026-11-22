@@ -10,17 +10,22 @@
 -- договора (так же, как кнопка «Вернуть график» на странице «Должники»).
 -- Внесённые платежи не трогаются, а поступившие деньги снова ложатся на
 -- график по очереди, поэтому клиент, который опережает график, перестаёт
--- быть должником. Прежний график сохраняется в crm.schedule_backup и его
--- можно вернуть кнопкой «Отменить возврат» (она появляется на странице
--- «Должники» сразу после возврата) -- либо спросите разработчика.
+-- быть должником. Прежний график сохраняется в crm.schedule_backup. Кнопки
+-- «Отменить возврат» после этого скрипта в программе НЕТ (она бывает только
+-- после возврата через страницу «Должники»): вернуть прежний график можно по
+-- запросу к разработчику.
 --
 -- ПОРЯДОК.
---   1. Запустите блок 085 из 000_full_setup.sql (если ещё не запускали).
+--   1. Запустите 000_full_setup.sql целиком (блок 085) -- если ещё не запускали.
 --   2. Выполните ШАГ 1 -- он только показывает, ничего не меняет.
 --   3. Посмотрите список. Договоры, где график переносили сознательно
 --      (договорённость с клиентом, «Пересчитать график», новая сумма
---      договора), чинить не нужно.
---   4. В ШАГЕ 2 впишите номера нужных договоров и выполните его.
+--      договора), чинить не нужно -- тогда этот скрипт не для вас.
+--   4. В ШАГЕ 2 впишите в v_expected число строк, которое показал шаг 1, и
+--      выполните его. Шаг 2 исправляет ровно те договоры, что в списке шага 1
+--      (номера вписывать не нужно -- латиница и кириллица в номерах путаются).
+--      Если список изменился и число не совпало, он остановится и ничего не
+--      тронет.
 -- ============================================================
 
 
@@ -84,39 +89,65 @@ where n.overdue > r.overdue + crm.debt_tolerance()
 order by n.overdue desc;
 
 
--- ============ ШАГ 2. Исправить выбранные договоры ============
--- Впишите номера договоров из шага 1 между скобками, например:
---     array['В-36-АША', 'В-33-ЗКҒ']
--- Пока список пуст, скрипт ничего не меняет.
+-- ============ ШАГ 2. Исправить договоры из списка шага 1 ============
+-- Впишите в v_expected число строк, которое показал шаг 1. Пока там 0 или число
+-- не совпадает со списком шага 1, скрипт ничего не меняет.
 do $$
 declare
-  v_numbers text[] := array[]::text[];  -- <<< СЮДА НОМЕРА ДОГОВОРОВ
-  v_num text;
+  v_expected integer := 0;   -- <<< СКОЛЬКО ДОГОВОРОВ ПОКАЗАЛ ШАГ 1
+  v_ids uuid[];
   v_id uuid;
-  v_found integer;
+  v_number text;
   v_rows integer;
 begin
-  foreach v_num in array v_numbers loop
-    select count(*) into v_found from crm.contracts where number = v_num;
-    if v_found <> 1 then
-      raise exception 'Номер договора "%": найдено % договоров, ожидался один. Ничего не изменено.', v_num, v_found;
-    end if;
-  end loop;
+  if v_expected < 1 then
+    raise exception 'Впишите в v_expected число строк, которое показал шаг 1. Ничего не изменено.';
+  end if;
 
-  foreach v_num in array v_numbers loop
-    select id into v_id from crm.contracts
-    where number = v_num
-      and payment_type in ('installment', 'rent')
-      and installment_months > 0
-      and amount > paid_amount;
-    if v_id is null then
-      raise notice 'Договор %: пропущен (нет рассрочки или уже оплачен полностью)', v_num;
-      continue;
-    end if;
+  -- Те же договоры, что показывает шаг 1: просрочка по датам договора меньше, чем сейчас.
+  select array_agg(x.id order by x.number), count(*)::int
+    into v_ids, v_rows
+  from (
+    with cand as (
+      select c.id, c.number, c.paid_amount
+      from crm.contracts c
+      where c.payment_type in ('installment', 'rent')
+        and c.status <> 'cancelled'
+        and c.installment_months > 0
+        and c.amount > c.paid_amount
+    ),
+    restored as (
+      select cd.id,
+             coalesce(sum(
+               least(b.amount, greatest(b.cum - greatest(cd.paid_amount - b.down, 0), 0))
+             ) filter (where b.due_date < current_date), 0) as overdue
+      from cand cd
+      cross join lateral crm.contract_baseline_plan(cd.id) b
+      group by cd.id
+    ),
+    now_ as (
+      select oi.contract_id as id, sum(oi.unpaid_amount) as overdue
+      from crm.overdue_installments oi
+      where oi.due_date < current_date and oi.unpaid_amount > 0.005
+      group by oi.contract_id
+    )
+    select cd.id, cd.number
+    from cand cd
+    join now_ n on n.id = cd.id
+    join restored r on r.id = cd.id
+    where n.overdue > r.overdue + crm.debt_tolerance()
+  ) x;
+
+  -- Защита: чинится ровно столько, сколько вы видели в шаге 1.
+  if coalesce(v_rows, 0) <> v_expected then
+    raise exception 'Шаг 1 сейчас показывает % договоров, а ожидалось %. Ничего не изменено.', coalesce(v_rows, 0), v_expected;
+  end if;
+
+  foreach v_id in array v_ids loop
+    select number into v_number from crm.contracts where id = v_id;
 
     perform set_config('crm.audit_off', 'on', true);
 
-    -- Прежний график -- в запас (его вернёт «Отменить возврат»).
     insert into crm.schedule_backup (contract_id, due_date, amount, reason)
     select contract_id, due_date, amount, 'restore_schedule'
     from crm.contract_payments where contract_id = v_id and not paid;
@@ -140,7 +171,7 @@ begin
         '_context', crm.audit_context('contract', v_id)
       )
     );
-    raise notice 'Договор %: график пересобран от даты договора (% строк)', v_num, v_rows;
+    raise notice 'Договор %: график пересобран от даты договора (% строк)', v_number, v_rows;
   end loop;
 end
 $$;
