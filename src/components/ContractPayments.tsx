@@ -13,6 +13,7 @@ import { TrashAction } from "@/components/ActionBar";
 import { AddButton } from "@/components/AddButton";
 import { receiptNumberFor } from "@/lib/contracts/receiptNumber";
 import { useRole, useAccess } from "@/lib/auth/useRole";
+import { DEBT_TOLERANCE } from "@/lib/contracts/debtTolerance";
 import type { Contract, ContractPayment } from "@/lib/contracts/types";
 
 function addMonths(dateStr: string, months: number) {
@@ -49,8 +50,15 @@ function allocatePlan(
     pool -= covered;
     result.set(row.id, {
       covered,
+      // "Covered" also when only dust is missing -- the same tolerance the debtors
+      // list applies (crm.debt_tolerance), so the card never shows a partly paid
+      // instalment for a client who is not in "Должники".
       state:
-        covered >= row.amount - 0.005 ? "covered" : covered > 0 ? "partial" : "upcoming",
+        row.amount - covered < DEBT_TOLERANCE
+          ? "covered"
+          : covered > 0
+            ? "partial"
+            : "upcoming",
     });
   }
   return result;

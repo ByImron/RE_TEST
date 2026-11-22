@@ -10080,3 +10080,319 @@ $$;
 grant execute on function crm.due_this_month_totals(uuid, boolean) to authenticated;
 
 notify pgrst, 'reload schema';
+
+-- ### 085_debt_tolerance_and_prepayment.sql
+
+-- ============================================================
+-- 085: два исправления «Должников».
+--
+-- 1) НЕДОПЛАТА МЕНЬШЕ 1 СОМОНИ НЕ ЯВЛЯЕТСЯ ДОЛГОМ.
+--    Рассрочка делится на дробные суммы (8 333,33), а клиент платит круглое
+--    (8 333). Недостающие 0,33 считались долгом: порог был 0,005, то есть
+--    полкопейки. Теперь остаток строки графика меньше crm.debt_tolerance()
+--    (1 денежная единица валюты договора) считается нулём -- в одном месте,
+--    в представлении crm.overdue_installments, откуда берут цифры и
+--    «Должники», и дашборд, и «К оплате в этом месяце». Недоплата не
+--    пропадает, а переезжает на следующий платёж; когда накопится 1 --
+--    станет просрочкой.
+--
+-- 2) КЛИЕНТ ЗАПЛАТИЛ БОЛЬШЕ, А ПОПАЛ В ДОЛЖНИКИ (ошибка блока 077).
+--    Триггер переплаты проверял: «клиент опережает график больше чем на
+--    ближайший платёж» -- то есть считал ближайший платёж УЖЕ ОПЛАЧЕННЫМ. Но
+--    потом он удалял весь неоплаченный план и раскладывал остаток по ВСЕМ
+--    будущим датам, включая эту ближайшую. Деньги при этом ушли на уменьшение
+--    остатка, и строка ближайшего срока снова стала неоплаченной: клиент,
+--    заплативший 19 000 за платёж 13 750, на следующий день после срока
+--    висел в должниках на полный платёж.
+--    Теперь строки будущих сроков, которые поступившее целиком покрывает,
+--    уходят из плана (как уходят покрытые строки, срок которых уже прошёл), а
+--    остаток раскладывается ровно по ОСТАЛЬНЫМ будущим срокам. Даты те же,
+--    конец договора не двигается, платежей становится на столько же меньше.
+--
+-- Данные договоров эта миграция НЕ меняет. Договоры, у которых график уже
+-- пересобран старым триггером, чинятся отдельным разовым скриптом
+-- supabase/one_off/2026-11-22_repair_prepaid_schedules.sql (сначала смотрим,
+-- потом правим), а не при каждом запуске этого файла.
+--
+-- Идемпотентно -- можно запускать повторно.
+-- ============================================================
+
+-- ---------- 1. допуск на копейки ----------
+create or replace function crm.debt_tolerance()
+returns numeric
+language sql
+immutable
+as $$ select 1::numeric $$;
+
+grant execute on function crm.debt_tolerance() to authenticated;
+
+-- Те же колонки и типы, что в блоке 043 -- поэтому create or replace.
+create or replace view crm.overdue_installments
+with (security_invoker = on)
+as
+with plan as (
+  select
+    p.id,
+    p.contract_id,
+    p.due_date,
+    p.amount,
+    sum(p.amount) over (
+      partition by p.contract_id
+      order by p.due_date, p.id
+      rows between unbounded preceding and current row
+    ) as cum
+  from crm.contract_payments p
+  where not p.paid
+),
+ctx as (
+  select
+    c.id                          as contract_id,
+    c.amount                      as contract_amount,
+    c.paid_amount,
+    coalesce(sum(pl.amount), 0)   as plan_total
+  from crm.contracts c
+  left join plan pl on pl.contract_id = c.id
+  where c.status <> 'cancelled'
+  group by c.id, c.amount, c.paid_amount
+),
+rows_ as (
+  select
+    pl.id,
+    pl.contract_id,
+    pl.due_date,
+    pl.amount,
+    least(
+      pl.amount,
+      greatest(pl.cum - greatest(ctx.paid_amount - (ctx.contract_amount - ctx.plan_total), 0), 0)
+    ) as unpaid
+  from plan pl
+  join ctx on ctx.contract_id = pl.contract_id
+)
+select
+  r.id            as payment_id,
+  r.contract_id,
+  r.due_date,
+  r.amount        as scheduled_amount,
+  case when r.unpaid < crm.debt_tolerance() then 0::numeric else r.unpaid end as unpaid_amount
+from rows_ r;
+
+grant select on crm.overdue_installments to authenticated;
+
+-- «График сдвинут вперёд» (блок 083): сравнение «по датам договора» и «сейчас»
+-- не должно срабатывать на те же копейки -- вместо порога 0,5 берём допуск.
+drop function if exists crm.schedule_shifts();
+create function crm.schedule_shifts()
+returns table (
+  contract_id uuid,
+  contract_number text,
+  client_id uuid,
+  client_name text,
+  currency text,
+  signed_date date,
+  installment_months integer,
+  contract_amount numeric,
+  paid_amount numeric,
+  next_plan_date date,
+  overdue_now numeric,
+  overdue_by_contract_date numeric
+)
+language sql
+stable
+security invoker
+
+as $$
+  with cand as (
+    select c.id, c.number, c.currency::text as cur, c.paid_amount, c.amount,
+           c.client_id, c.installment_months as months,
+           coalesce(c.signed_date, c.created_at::date) as signed,
+           coalesce(cl.name, '—') as client_name
+    from crm.contracts c
+    left join crm.clients cl on cl.id = c.client_id
+    where c.payment_type in ('installment', 'rent')
+      and c.status <> 'cancelled'
+      and c.installment_months > 0
+      and c.amount > c.paid_amount
+      and exists (select 1 from crm.contract_payments p where p.contract_id = c.id and not p.paid)
+      and not exists (select 1 from crm.schedule_shift_dismissed d where d.contract_id = c.id)
+  ),
+  -- Money received on the day of signing or earlier = the initial payment: it is not
+  -- part of the instalment plan (same rule as crm.contract_baseline_plan).
+  base as (
+    select cd.id, cd.months, cd.signed, cd.paid_amount,
+           cd.amount - least(coalesce(sum(p.amount) filter (
+             where p.paid and coalesce(p.paid_date, p.due_date) <= cd.signed), 0), cd.amount) as total,
+           least(coalesce(sum(p.amount) filter (
+             where p.paid and coalesce(p.paid_date, p.due_date) <= cd.signed), 0), cd.amount) as down
+    from cand cd
+    left join crm.contract_payments p on p.contract_id = cd.id
+    group by cd.id, cd.months, cd.signed, cd.paid_amount, cd.amount
+  ),
+  -- The plan as it was at signing: n equal parts (the last one takes the cents), month by month
+  -- from the contract date. Pure arithmetic -- no table is read here.
+  plan as (
+    select b.id, b.paid_amount, b.down,
+           (b.signed + (g.i || ' month')::interval)::date as due,
+           case when g.i < b.months then floor(b.total / b.months * 100) / 100
+                else round((b.total - floor(b.total / b.months * 100) / 100 * (b.months - 1)) * 100) / 100 end as amt,
+           case when g.i < b.months then floor(b.total / b.months * 100) / 100 * g.i else b.total end as cum
+    from base b
+    cross join lateral generate_series(1, b.months) g(i)
+  ),
+  restored as (
+    select pl.id,
+           coalesce(sum(
+             least(pl.amt, greatest(pl.cum - greatest(pl.paid_amount - pl.down, 0), 0))
+           ) filter (where pl.due < current_date), 0) as overdue
+    from plan pl
+    group by pl.id
+  ),
+  now_ as (
+    select oi.contract_id as id, sum(oi.unpaid_amount) as overdue
+    from crm.overdue_installments oi
+    where oi.due_date < current_date and oi.unpaid_amount > 0.005
+    group by oi.contract_id
+  ),
+  nxt as (
+    select p.contract_id as id, min(p.due_date) as next_date
+    from crm.contract_payments p
+    where not p.paid and p.contract_id in (select id from cand)
+    group by p.contract_id
+  )
+  select cd.id, cd.number, cd.client_id, cd.client_name, cd.cur,
+         cd.signed, cd.months, cd.amount, cd.paid_amount, nxt.next_date,
+         coalesce(n.overdue, 0), r.overdue
+  from cand cd
+  join restored r on r.id = cd.id
+  left join now_ n on n.id = cd.id
+  left join nxt on nxt.id = cd.id
+  where r.overdue > coalesce(n.overdue, 0) + greatest(crm.debt_tolerance(), 0.5)
+  order by r.overdue - coalesce(n.overdue, 0) desc, cd.id;
+$$;
+
+grant execute on function crm.schedule_shifts() to authenticated;
+
+-- ---------- 2. переплата: покрытые будущие платежи уходят из графика ----------
+create or replace function crm.rebalance_schedule_after_payment()
+returns trigger
+language plpgsql
+security definer
+set search_path = crm, public
+as $$
+declare
+  c crm.contracts;
+  v_paid numeric;
+  v_plan_total numeric;
+  v_pool numeric;
+  v_due_total numeric;
+  v_extra numeric;
+  v_first numeric;
+  v_covered_sum numeric := 0;
+  v_skip integer := 0;
+  v_remaining numeric;
+  v_dates date[];
+  v_n integer;
+  v_base numeric;
+  v_amount numeric;
+  r record;
+  i integer;
+begin
+  select * into c from crm.contracts where id = new.contract_id;
+  if not found or c.status = 'cancelled' or c.payment_type not in ('installment', 'rent') then
+    return null;
+  end if;
+
+  select coalesce(sum(amount) filter (where paid), 0),
+         coalesce(sum(amount) filter (where not paid), 0)
+    into v_paid, v_plan_total
+  from crm.contract_payments where contract_id = c.id;
+
+  v_remaining := c.amount - v_paid;
+  if v_remaining <= 0.005 or v_plan_total <= 0 then
+    return null;
+  end if;
+
+  -- Сколько поступившего легло на план (по очереди, от старых строк к новым).
+  v_pool := greatest(v_paid - (c.amount - v_plan_total), 0);
+
+  -- Строки, срок которых уже наступил, закрыты первыми; всё, что сверх них, --
+  -- это опережение графика.
+  select coalesce(sum(amount), 0) into v_due_total
+  from crm.contract_payments
+  where contract_id = c.id and not paid and due_date <= current_date;
+  v_extra := v_pool - v_due_total;
+
+  select amount into v_first
+  from crm.contract_payments
+  where contract_id = c.id and not paid and due_date > current_date
+  order by due_date, id limit 1;
+
+  -- Нет будущих строк -- пересчитывать не на что; и пока клиент не опередил
+  -- график больше чем на один ближайший платёж -- график остаётся как есть
+  -- (деньги ложатся на строки по очереди, просрочки нет).
+  if v_first is null or v_extra - v_first <= 0.5 then
+    return null;
+  end if;
+
+  -- Будущие сроки, которые опережение закрывает ЦЕЛИКОМ: платёж по ним уже
+  -- внесён, поэтому строки из графика уходят. Раньше они оставались и
+  -- получали долю остатка -- и клиент, заплативший вперёд, на следующий день
+  -- после срока значился должником на полный платёж.
+  for r in
+    select amount
+    from crm.contract_payments
+    where contract_id = c.id and not paid and due_date > current_date
+    order by due_date, id
+  loop
+    exit when v_covered_sum + r.amount > v_extra + 0.005;
+    v_covered_sum := v_covered_sum + r.amount;
+    v_skip := v_skip + 1;
+  end loop;
+
+  select array_agg(due_date order by due_date, id), count(*)::int
+    into v_dates, v_n
+  from (
+    select due_date, id
+    from crm.contract_payments
+    where contract_id = c.id and not paid and due_date > current_date
+    order by due_date, id
+    offset v_skip
+  ) rest;
+
+  -- Закрыты все будущие сроки -- раскладывать остаток не по чему.
+  if v_n is null or v_n < 1 then
+    return null;
+  end if;
+
+  -- Перестройка -- одно действие, а не 2N записей в журнале.
+  perform set_config('crm.audit_off', 'on', true);
+
+  delete from crm.contract_payments where contract_id = c.id and not paid;
+
+  v_base := floor(v_remaining / v_n * 100) / 100;
+  for i in 1..v_n loop
+    if i = v_n then
+      v_amount := round((v_remaining - v_base * (v_n - 1)) * 100) / 100;
+    else
+      v_amount := v_base;
+    end if;
+    insert into crm.contract_payments (contract_id, due_date, amount, paid, paid_date)
+    values (c.id, v_dates[i], v_amount, false, null);
+  end loop;
+
+  perform set_config('crm.audit_off', 'off', true);
+
+  insert into crm.audit_log (actor_id, action, entity_type, entity_id, details)
+  values (
+    auth.uid(), 'update', 'contract', c.id,
+    jsonb_build_object(
+      'schedule_rebalanced', true,
+      'schedule_payments', v_n,
+      'schedule_remaining', v_remaining,
+      '_context', crm.audit_context('contract', c.id)
+    )
+  );
+  return null;
+end;
+$$;
+
+notify pgrst, 'reload schema';
